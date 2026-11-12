@@ -1,5 +1,7 @@
 # 多密钥分流指挥家 · Multi-Key Orchestrator
 
+[English](README.md) · **简体中文**
+
 手里攥着三把 API Key，跑起来却永远只有一把在干活？这个插件就是来解决这件事的。
 
 一个 DSH 插件。它不碰 Harness 的源码，不改你的模型配置，也不改请求内容——只决定这一次请求由你哪一把 Key 来跑。

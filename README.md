@@ -1,10 +1,10 @@
 # Multi-Key Orchestrator
 
-中文名：**多密钥分流指挥家**
+**English** · [简体中文](README.zh-CN.md)
 
 Spread one conversation's requests across the several API keys you already configured for a provider, so all of their quotas get used instead of leaning on the single key in your settings.
 
-A DSH plugin. It does not patch the Harness, does not replace a model adapter, and does not change your requests — it only decides which of your own keys carries each one.
+A DSH plugin. It does not patch the Harness, does not replace a model adapter, and does not change your requests — it only decides which of your own keys carries each one. Chinese name: **多密钥分流指挥家**.
 
 ---
 
