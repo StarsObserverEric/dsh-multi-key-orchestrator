@@ -1,199 +1,209 @@
-# Multi-Key Orchestrator
+# 多密钥分流指挥家 · Multi-Key Orchestrator
 
-**English** · [简体中文](README.zh-CN.md)
+**简体中文** · [English](README.en.md)
 
-Spread one conversation's requests across the several API keys you already configured for a provider, so all of their quotas get used instead of leaning on the single key in your settings.
+手里攥着三把 API Key，跑起来却永远只有一把在干活？这个插件就是来解决这件事的。
 
-A DSH plugin. It does not patch the Harness, does not replace a model adapter, and does not change your requests — it only decides which of your own keys carries each one. Chinese name: **多密钥分流指挥家**.
-
----
-
-## What it does
-
-**Three keys, and only one of them ever works.** You configured several keys for the same provider, each with its own quota. To actually use them, you have to wait for one to run dry, open settings, switch keys by hand, and do it again next week.
-
-**You want more subagents, upstream says no.** The provider caps concurrency, so firing several at once earns a 429 — even though you are paying for other keys that are sitting completely idle.
-
-**Pooling only ever kicked in for subagents.** Even with several keys configured, a single conversation still burned through one key, because nothing rotated between them mid-conversation.
-
-This plugin fills that gap: **every request in a conversation is handed to whichever key is currently the least busy.**
-
-- Consecutive requests inside the same conversation land on different keys; you do not have to spawn subagents before the other keys see any traffic.
-- Concurrent requests go to the key holding the fewest leases.
-- Keys that are out of quota, cooling down after a rate limit, or switched off are excluded automatically.
+一个 DSH 插件。它不碰 Harness 的源码，不改你的模型配置，也不改请求内容——只决定这一次请求由你哪一把 Key 来跑。
 
 ---
 
-## What else it gives you
+## 🎼 它解决什么问题
 
-### 1. Concurrency caps at three levels, enforced for you
+场景一：你给同一个服务方配了多把密钥，额度各自独立。然而为了充分利用这些额度，你只能等一把密钥的额度跑光之后，手动进设置，再一次次切换密钥。
 
-The same three knobs exist for **any provider, any model, any key** — nothing is hard-coded to one platform:
+场景二：你想多开几个子智能体，可上游有并发限制，一发多了直接被 429 拦下来。明明手上有好几把空闲密钥，却没法实时切过去。
 
-| Level | What it limits |
+场景三：好不容易配了多把密钥，结果要等到开子智能体才会轮到第二把——单开一个对话，还是只用一把。
+
+这个插件补的就是中间那一层：**同一个对话里的每一个请求，都会交给当前最闲的那把 Key。**
+
+- 一个对话里连续的几次请求，会依次落到不同的 Key 上，不需要开子智能体。
+- 同时发多个请求时，谁手上活最少就给谁。
+- 额度用尽、刚被限流冷却、或者被你手动停用的 Key，自动排除，不参与分配。
+
+于是几把 Key 的额度会一起往下走，而不是一把先烧光。
+
+---
+
+## 🎚️ 附带能力
+
+### 1. 三级并发上限，插件替你把闸门
+
+这三个旋钮对**任何服务方、任何模型、任何 Key**都成立，不针对某个平台：
+
+| 层级 | 管什么 |
 |---|---|
-| Provider | how many requests may be in flight across every model and key of that provider |
-| Model | how many requests may be in flight for that one model |
-| Individual API key | how many requests that one key may hold for that one model |
+| 服务方（Provider） | 这家服务方下所有模型、所有 Key 加起来，同时最多发多少个请求 |
+| 模型（Model） | 这一个模型同时最多发多少个请求 |
+| 单个 API Key | 这一把 Key 在这一个模型上同时最多发多少个请求 |
 
-The plugin queues against those caps instead of overshooting them and collecting 429s: a request that would exceed a cap waits inside the plugin and resumes as soon as a slot frees. You choose the numbers; the plugin assumes nothing about any platform's limits.
+到顶的请求会在插件里排队，等有人让出位置就继续，而不是继续往外冲然后被上游打成 429。数值由你填，插件不猜任何平台的限制。
 
-**The main conversation always keeps a slot.** Each model's total can reserve slots exclusively for the main conversation (one by default). No amount of subagent traffic can take that slot, so the conversation you are sitting in never starves.
+**主进程永远有位置。** 每个模型的总并发里可以预留几个槽位专供主进程（默认 1 个）。子智能体再忙也抢不走，所以你正在聊的这个对话不会被自己的子智能体饿住。
 
-### 2. Lend the reserve while the main conversation is idle
+### 2. 主进程空闲时，把保留槽位借给子智能体
 
-A reserve costs subagents capacity all the time. If you would rather let them run at full width whenever you are not typing, turn on **Lend the reserved slot to subagents while the main process is idle**: after the main conversation has been idle briefly, the reserve is lent out; the moment it issues a request, the reserve is taken back.
+保留槽位会让子智能体始终少用一点。如果你更希望「我没在打字的时候，子智能体可以吃满」，把**主进程空闲时把保留槽位借给子智能体**勾上：主进程空闲一小会儿后自动借出，主进程一发请求立刻收回。
 
-### 3. A request that hits 429 recovers on its own
+### 3. 被 429 拦下的请求会自己活过来
 
-- A request queued inside the pool is released automatically as soon as any key frees a slot — you never re-send it by hand.
-- A request rate-limited upstream (429) is not handed straight back: the plugin cools that key briefly and retries on another.
-- A request cut off by a 429 *after* it already streamed some text is run again from the start (the partial output is discarded and the answer is regenerated), which the layer above sees as an ordinary retry.
+- 在池子里排队的请求，只要有 Key 释放出位置，就会被自动放行继续，不需要主进程重新发起。
+- 请求打到上游被限流（429）时，插件不会直接把错误扔回来：它让这把 Key 短暂冷却，换一把 Key 重发。
+- 已经吐出半截文字才被 429 打断的请求，会被重新跑一遍（丢掉半截输出，重新生成），上层看到的只是一次普通重试。
 
-The boundary: recovery is bounded by a retry budget (20 attempts and 30 minutes of waiting by default). Once that is spent the error surfaces normally instead of retrying forever — infinite retrying only leaves a spinner on screen.
+说清楚边界：自救是有预算的（默认最多 20 次尝试、最长等 30 分钟）。预算用完，错误会正常返回给你——无限重试只会让界面永远转圈。
 
 ---
 
-## Install
+## 📦 安装
 
-Requires DSH Desktop.
+需要 DSH 桌面版。
 
-**From GitHub**
+**从 GitHub 安装**
 
 ```sh
 dsh plugin --profile desktop add github:StarsObserverEric/dsh-multi-key-orchestrator
 ```
 
-**From npm**
+**从 npm 安装**
 
 ```sh
 dsh plugin --profile desktop add @starsobservereric/dsh-multi-key-orchestrator
 ```
 
-**From a local directory**
+**从本地文件夹安装**
 
 ```sh
-dsh plugin --profile desktop add /path/to/dsh-multi-key-orchestrator
+dsh plugin --profile desktop add /你的路径/dsh-multi-key-orchestrator
 ```
 
-Then **quit DSH completely and start it again**. The host half is loaded at process start; hot-reloading it does nothing.
+装好之后**完全退出 DSH 再重新打开**。插件的宿主部分在进程启动时加载，热更新对它没用。
 
-Uninstall:
+卸载：
 
 ```sh
 dsh plugin --profile desktop remove @starsobservereric/dsh-multi-key-orchestrator
 ```
 
-Turning the plugin off never touches your keys or your model configuration; it just returns DSH to its normal single-key behaviour.
+关掉插件不会动你的 Key 和模型配置，只是回到 DSH 原生的单 Key 行为。
 
 ---
 
-## Using it
+## 🧭 界面导览
 
-### Where it lives
+### 入口在哪儿
 
-The navigation icon column on the left, one row **below Context Insights**, named **Multi-Key Orchestrator**. Clicking it opens the full-page panel. There is no other entry point and no floating window.
+**左上角的插件图标区**，点那个音符图标（**多密钥分流指挥家** / Multi-Key Orchestrator），主区域就会打开整页面板。
 
-### Top of the page
+没有别的入口，也没有悬浮小窗。
 
-| Control | Meaning |
+### 页面顶部
+
+| 控件 | 意思 |
 |---|---|
-| Master switch | off = the plugin steps aside entirely and every request uses DSH's native single-key path; your configuration is kept |
-| Expand all / Collapse all | open or close every provider at once |
-| Refresh all balances | query every key's balance right now (otherwise refreshed in the background) |
-| Pending bar | appears when you have unsaved edits: `N pending changes` with **Apply** / **Discard** |
+| 编排总开关（Master switch） | 关掉＝插件完全让路，所有模型回到 DSH 原生的单 Key 行为，配置都还在 |
+| 全部展开 / 全部收起（Expand all / Collapse all） | 一次打开或收起所有服务方 |
+| 刷新状态（Refresh） | 重新读一次插件状态 |
+| 刷新全部余额（Refresh all balances） | 立刻查一遍所有 Key 的余额，平时是后台自动查 |
+| 顶部提示条 | 有没保存的修改时出现：`N 项待保存`（pending changes），旁边是**应用**（Apply）和**放弃**（Discard） |
 
-**Edits only take effect after Apply.** Typing in a field changes a local draft only; nothing is sent and nothing is saved until you press Apply.
+**改完必须点「应用」。** 输入框里的改动只是草稿，不点应用不会生效，也不会发出任何请求。
 
-### Inside a provider
+### 一个服务方展开后
 
-Providers are collapsed by default; click the header to open one. Top to bottom:
+服务方（Provider）默认是收起的，点标题展开。自上而下：
 
-**Provider concurrency** — the total in-flight limit for this provider. Empty or `0` means unlimited.
+**服务方并发（Provider concurrency）** — 这家服务方的总并发上限。`0 或留空表示不限制。`
 
-**API keys** — every key belonging to this provider.
+**API Key** — 这家服务方下的所有 Key。
 
-- Each row shows: the mask (always dots), where the key came from, the provider-side account id (an identifier, never the secret), state (healthy / cooling / exhausted / disabled), failure count, last success, an editable **note**, and an **enabled** checkbox.
-- The key **adopted from your settings** is marked `from Settings` and always sits first. It cannot be removed or hidden — it is your own credential, and the plugin only borrows it.
-- Only keys you added here have **Remove key**, which also deletes the credential the plugin stored for it.
-- The **balance card** on the right shows remaining / limit, a bar, quota state, when it was last checked, when it will be checked next, the reset time to the second, and a manual refresh. If the provider exposes no quota endpoint, the card says why instead of inventing a number.
-- The last row adds a key: a note plus a write-only password field that clears on submit; afterwards the key is only ever shown as dots.
+- 每一行左边：圆点掩码（永远只显示点）、来源、服务方 Key 标识（服务方返回的编号，不是密钥）、
+  状态（健康 / 冷却中 / 额度用尽 / 已停用）、失败情况（`无失败` 或 `N 次失败 · M×429`）、
+  上次成功时间、可改的**备注名**、**启用**勾选框。
+- **来自设置的那把 Key** 会标 `来自设置`，并且永远排在第一个。它不能删也不能藏——那是你在 DSH 设置里配的真实凭据，插件只是借用。
+- 只有你自己在面板里添加的 Key（标 `在此添加`）才有**删除 Key**。
+- 右边是**余额**卡片：剩余 / 上限、进度条、额度状态（充足 / 偏低 / 已用尽 / 不支持）、检查于、下次检查、重置于（精确到秒）、以及一个刷新按钮。服务方没提供额度接口时，这里会写明原因，不会编一个数字。
+- 最下面一行是**添加 Key**：备注名 + 只写输入框（提交后清空，之后永远只显示圆点）。
 
-**Models** — one row per model this provider declares (read from your DSH settings).
+**模型（Models）** — 这家服务方声明的每个模型一行，来自你 DSH 设置里的模型列表。
 
-- **total** — the in-flight limit for this model.
-- **Link total to per-API caps** — when checked, `total` greys out and equals the sum of the per-key caps, with the arithmetic printed underneath (`total = 3 + 3 + 2 = 8`). Uncheck it and `total` becomes editable.
-- **Reserved for main** — how many of this model's slots are kept for the main conversation.
-- **Lend the reserved slot…** — whether that reserve may be lent to subagents while the main conversation is idle.
-- **Per-API caps** — one column per key: that key's own limit for this model. Empty means no extra limit for that column.
-- The line under the grid is live: main leases, subagent leases, capacity, and how many requests are waiting.
+- **总并发（total）**：这个模型同时最多发多少个请求。
+- **总并发联动每个 Key 的上限（Link total to per-API caps）**：勾上时总并发变灰只读，等于下面每个 Key 上限之和，框下面直接写算式（`总并发 = 3 + 3 + 2 = 8`）。取消勾选就变亮，可以手填。
+- **主进程保留（Reserved for main）**：从这个模型的总并发里留几个给主进程。
+- **主进程空闲时把保留槽位借给子智能体（Lend the reserved slot…）**：要不要把预留借出去。
+- **每个 API 的上限（Per-API caps）**：一列一把 Key，填这把 Key 在这个模型上的上限。`0 = 这个模型下不限该 Key 的并发`。
+- 下面一行是实时状态：`主进程 X · 子智能体 Y/Z · 排队 W`。
 
-### Bottom of the page
+### 页面底部
 
-- **Diagnostics** — how requests are correlated with sessions, a recent-activity log (every acquire, release and cooldown), and a self-test that exercises the caps and the queue with simulated traffic without sending a single real request.
-- **Rolling back** — three ways to stop: flip the switch, disable the plugin on the Plugins page, or uninstall. The native request path was never modified, so nothing else needs undoing.
-
----
-
-## Practical advice
-
-1. **Give one provider at least two keys.** With a single key there is nothing to distribute, so the plugin stays out of the way and behaviour is unchanged.
-2. **Fill in the caps you actually know.** The plugin never guesses a platform's limits: set them too high and upstream will rate-limit you, too low and you hold yourself back. A common start is one key's real concurrency per column and the linked total.
-3. **Do not reserve zero slots** unless you are sure the main conversation never needs priority.
-4. **Balances are not real-time.** They refresh on an interval and the card states when it was last checked and whether the number is cached; press refresh to force one.
-5. **Notes are for you only.** They are never sent to the provider. Naming keys after their accounts is the easiest way to keep track of several keys under one person.
-6. **Deleting a key in DSH settings will not break the plugin** — it re-reads the configuration and reports the missing credential.
+- **诊断（Diagnostics）**：请求关联方式（异步上下文 / FIFO 兜底）、**最近活动**（每次取得、释放、冷却都记一行）、**运行分配自检**（用模拟流量验证并发和排队，不会真的发请求）。
+- **回退方式（Rolling back）**：三种停用办法——关总开关、在「插件」页面停用这一行、或者直接移除插件包。原生请求链路从未被改动，所以不需要恢复别的东西。
 
 ---
 
-## How it works
+## 💡 用之前先看这几条
 
-For anyone extending or debugging it.
+1. **先给一个服务方配够 2 把 Key。** 只有 1 把时没有可分配的对象，插件会自动让路。
+2. **上限照实际情况填。** 插件不猜任何平台的数字：填大了会被上游 429，填小了你自己吃亏。常见起点是「单 Key 填上游允许的并发，总并发打开联动」。
+3. **主进程保留别填 0**，除非你确定主对话不需要随时可用。
+4. **余额不是实时的。** 卡片上会写检查于什么时候、是不是缓存值；要立刻更新就点刷新。
+5. **备注名只对你有意义**，不会发给服务方。同一个人的多个账号，用「工作号 / 备用号」区分最省事。
+6. **在 DSH 设置里删掉 Key 不会让插件崩**，它会重新读配置并提示凭据缺失。
 
-**Where it hooks in.** The plugin does not register a model adapter (registering over an existing route is rejected). Instead it works on three seams that already exist:
+---
 
-- `llm/stream` — every model request passes through. The plugin takes a lease, picks a key, calls downstream, and records the outcome here.
-- `llm-pi-ai/request-headers` — the synchronous seam just before headers go out. The plugin swaps `authorization` / `x-api-key` for the chosen key's real secret. The request body is frozen, so it only ever swaps credentials — never the model, never the content.
-- `agent/request-error` — the seam before an error is handed upward. On a mid-stream rate limit the plugin takes ownership and asks for one retry.
+## ❓ 常见问题
 
-**Scheduling.** One pool per provider + model, holding that provider's keys. Selection order:
+**配了好几把 Key，面板里只看到一把？**
+面板显示的是「来自设置」的那把 + 「在此添加」的那几把。如果别处配的 Key 没出现，先确认它属于同一个服务方。
+
+**余额一直是空的？**
+这家服务方没有提供额度接口，或者这次查询失败了——卡片上会写是哪种。没有余额不影响分流。
+
+**数字改了没反应？**
+没点「应用」。所有改动都是草稿。
+
+**还会遇到 429 吗？**
+在你设置的并发范围内不会；如果你填的上限超过账号本身的限制，或者多个 DSH 窗口共用一个账号，仍可能遇到。遇到也没关系，插件会冷却那把 Key 并换下一把。
+
+**关掉插件会丢配置吗？**
+不会。开关、上限、Key 清单、备注都存在插件自己的状态文件里。
+
+---
+
+## 🔧 它是怎么做到的
+
+不太关心实现可以跳过，这里只讲大意。
+
+**换 Key 的位置。** 插件不注册新的模型适配器（同一路由注册会被拒绝），而是在三个已经存在的接缝上工作：
+
+- `llm/stream`：每个模型请求都会经过。插件在这里取位置、挑 Key、调下游、记录成败。
+- `llm-pi-ai/request-headers`：请求头发出前的同步接缝。插件在这里把 `authorization` 换成选中那把 Key 的真实值。请求体是冻结的，所以它只换凭据，**不改模型、不改内容**。
+- `agent/request-error`：错误回传前的接缝。回答中途被限流时，插件在这里接住，要求重试一次。
+
+**怎么挑 Key。** 每个「服务方 + 模型」一个池子，池子里是这家服务方的 Key。排序是：
 
 ```
-fewest active leases → rotation cursor → health → most recent success
+当前租约最少 → 轮转游标 → 健康度 → 最近成功时间
 ```
 
-Leases first keeps concurrency even; the rotation cursor second keeps **sequential** requests moving between keys (without it a single conversation would keep hitting the same key); health and recency only break the remaining ties. Cooling, exhausted and disabled keys are excluded outright.
+租约最少排第一，保证并发均摊；轮转游标排第二，保证**串行请求也会换 Key**（否则一个对话只会用同一把）；健康和最近成功只在前面都打平时才起作用。冷却中、额度用尽、被停用的直接排除。
 
-**Leases.** Taking a key creates a lease; the request returns it in `finally` — including when it throws — so a crashed request can never hold a slot forever.
+**位置怎么还回去。** 取用即登记一个租约，请求结束（包括报错）在 `finally` 里归还。所以崩掉的请求不会永久占着一个位置。
 
-**Two lanes.** `main` is the conversation you are in, `child` is subagents. Child capacity is the total minus the reserve, and the reserve can be lent out when the main lane is idle.
+**两条泳道。** `main` 是主进程，`child` 是子智能体。子智能体容量 = 总并发 − 保留槽位；保留槽位可以按需借出。
 
-**Gates.** A provider-wide gate is shared across that provider's models, the pool gate covers the model, and a per-key gate covers each column — all three apply at once.
+**三层闸门。** 服务方级闸门跨模型共享，池内闸门管模型，单 Key 闸门管那一列，三层同时生效。
 
-**Quota gate.** When a provider exposes a quota endpoint the plugin polls it and temporarily excludes keys at zero, so an empty account never gets picked only to be rate-limited. Polling is a read-only account call and spends nothing. Providers without such an endpoint simply show no balance; everything else still works.
+**额度门控。** 服务方提供额度接口时，插件定期查询，把额度为 0 的 Key 暂时排除，免得拿空号去撞 429。查询是只读的账户接口，不消耗任何额度。查不到余额的服务方只是不显示余额，其它功能照常。
 
-**State.** The switch, caps, key list and notes live in the plugin's own state file (`.state/state.json` inside the plugin directory, mode 0600). Your profile configuration is never rewritten, and secrets go to DSH's credential service — the plugin's file only holds reference names.
+**配置放哪儿。** 开关、上限、Key 清单、备注存在插件自己的状态文件里（插件目录下 `.state/state.json`，权限 0600），不写你的 profile 配置，也不改写 DSH 设置。凭据本体交给 DSH 的凭据服务，插件文件里只有引用名。
 
-**Routes.** Four local routes (`status`, `config`, `probe`, `selftest`), all of which refuse anything that is not a loopback request, to rule out DNS rebinding.
-
----
-
-## FAQ
-
-**I configured several keys but only one appears.**
-The panel shows the key adopted from your settings (marked `from Settings`) plus the keys you added here (`added here`). If a key you configured elsewhere is missing, check that it belongs to the same provider.
-
-**Why is the balance empty?**
-That provider exposes no quota endpoint, or the lookup failed — the card states which. A missing balance never affects routing.
-
-**I changed a number and nothing happened.**
-You did not press Apply. Every edit is a draft until then.
-
-**Will I still see 429s?**
-Not inside the limits you set; you can still hit them if your caps exceed what the account allows, or if several DSH windows share one account. When it happens the plugin cools that key and moves on.
+**对外接口。** 四个本机路由（`status` / `config` / `probe` / `selftest`），全部只接受来自本机回环地址的请求，防止 DNS rebinding。
 
 ---
 
-## License
+## 许可
 
-MIT.
+MIT。

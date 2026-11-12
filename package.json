@@ -49,7 +49,7 @@
     "locale/zh.json",
     "icon.svg",
     "README.md",
-    "README.zh-CN.md",
+    "README.en.md",
     "LICENSE",
     "docs/quota-contract.md"
   ],
