@@ -1,0 +1,822 @@
+/**
+ * Host-level smoke test: activate the plugin against a fake Cordis context and
+ * drive the real waterfalls, routes and state file. This is the check that must
+ * pass before the bundle is installed, because it exercises the wiring that the
+ * pure unit tests cannot see.
+ *
+ * Run with: node --test test/
+ */
+
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+const STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'multi-key-state-'))
+process.env.DSH_MULTI_KEY_STATE_DIR = STATE_DIR
+
+/** Controllable biller so no test ever touches the network. */
+const biller = { remaining: 900, fail: false }
+globalThis.fetch = async () => {
+  if (biller.fail) throw new Error('ECONNREFUSED')
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({ windows: [{ limit: 1000, used: 1000 - biller.remaining, remaining: biller.remaining }], unit: 'credits' }),
+  }
+}
+
+const host = await import('../host.js')
+
+/** A minimal Cordis context with the services this plugin touches. */
+function createHarness() {
+  const listeners = new Map()
+  const routes = new Map()
+  const disposers = []
+  const credentialStore = new Map()
+
+  const credentials = {
+    async set(ref, value) {
+      credentialStore.set(ref, value)
+    },
+    async unset(ref) {
+      credentialStore.delete(ref)
+    },
+    async resolve(ref) {
+      const value = credentialStore.get(ref)
+      return value ? { value } : undefined
+    },
+  }
+
+  const ctx = {
+    logger: () => ({ debug() {} }),
+    on(name, handler) {
+      const list = listeners.get(name) ?? []
+      list.push(handler)
+      listeners.set(name, list)
+      return () => {
+        const live = listeners.get(name) ?? []
+        const index = live.indexOf(handler)
+        if (index >= 0) live.splice(index, 1)
+      }
+    },
+    effect(fn) {
+      const result = fn()
+      disposers.push(typeof result === 'function' ? result : () => {})
+    },
+    get(name) {
+      if (name === 'credentials') return credentials
+      // The profile declares its providers in the llm-pi-ai settings entry, which
+      // is exactly what the panel catalog is supposed to read.
+      if (name === 'settings') {
+        return {
+          describe: () => [
+            {
+              ns: 'llm-pi-ai',
+              value: {
+                providers: {
+                  ecnu: {
+                    displayName: 'ECNU',
+                    baseURL: 'https://chat.ecnu.edu.cn/open/api/v1',
+                    api: 'openai-completions',
+                    models: [
+                      { id: 'ecnu-max', name: 'ecnu-max' },
+                      { id: 'ecnu-plus', name: 'ecnu-plus' },
+                    ],
+                  },
+                },
+              },
+            },
+          ],
+        }
+      }
+      if (name === 'llm') {
+        return {
+          listProviders: () => [{ id: 'ecnu', name: 'ecnu' }],
+          listModels: async (provider) =>
+            provider === 'ecnu' ? [{ provider: 'ecnu', id: 'ecnu-max', name: 'ecnu-max' }] : [],
+          listConfigurableProviders: () => [
+            { provider: 'ecnu', defaultBaseURL: 'https://chat.ecnu.edu.cn/open/api/v1' },
+          ],
+        }
+      }
+      return undefined
+    },
+    webServer: {
+      register(route) {
+        routes.set(route.path, route)
+        return () => routes.delete(route.path)
+      },
+    },
+  }
+
+  const listener = (name) => {
+    const list = listeners.get(name)
+    assert.ok(list && list.length > 0, `no listener registered for ${name}`)
+    return list[0]
+  }
+
+  const call = (suffix, method, body) =>
+    new Promise((resolve, reject) => {
+      const route = routes.get(`/api/multi-key-orchestrator/${suffix}`)
+      if (!route) {
+        reject(new Error(`no route for ${suffix}`))
+        return
+      }
+      const handlers = {}
+      const request = {
+        method,
+        // A real browser call is loopback-addressed and same-origin; the route
+        // guard checks exactly that, so the fixture must look the same.
+        headers: { host: '127.0.0.1:13769', origin: 'http://127.0.0.1:13769' },
+        on(event, handler) {
+          handlers[event] = handlers[event] ?? []
+          handlers[event].push(handler)
+          return request
+        },
+        destroy() {},
+      }
+      const response = {
+        statusCode: 0,
+        writeHead(code) {
+          this.statusCode = code
+        },
+        end(chunk) {
+          const text = chunk ?? ''
+          resolve({ code: this.statusCode, body: text ? JSON.parse(text) : undefined })
+        },
+      }
+      setImmediate(() => {
+        if (body !== undefined) {
+          for (const handler of handlers.data ?? []) handler(Buffer.from(JSON.stringify(body)))
+        }
+        for (const handler of handlers.end ?? []) handler()
+      })
+      route.handler(request, response)
+    })
+
+  return {
+    ctx,
+    routes,
+    credentialStore,
+    listener,
+    call,
+    dispose() {
+      for (const disposer of disposers.splice(0)) {
+        try {
+          disposer()
+        } catch {
+          /* disposal order is not under test */
+        }
+      }
+    },
+  }
+}
+
+/** Consume an async iterable into an array. */
+async function collect(iterable) {
+  const chunks = []
+  for await (const chunk of iterable) chunks.push(chunk)
+  return chunks
+}
+
+const SUCCESS = [
+  { type: 'block-start', index: 0, blockType: 'text' },
+  { type: 'text-delta', index: 0, text: 'hel' },
+  { type: 'text-delta', index: 0, text: 'lo' },
+  { type: 'finish', reason: { kind: 'stop' } },
+]
+const RATE_LIMIT = [
+  { type: 'finish', reason: { kind: 'error', failure: { code: 'RATE_LIMIT', status: 429, message: 'rate limit exceeded', providerRetryAfterMs: 15_000 } } },
+]
+const MID_STREAM_429 = [
+  { type: 'text-delta', index: 0, text: 'partial answer' },
+  { type: 'finish', reason: { kind: 'error', failure: { code: 'RATE_LIMIT', status: 429, message: 'rate limit exceeded', providerRetryAfterMs: 20_000 } } },
+]
+const BAD_KEY = [
+  { type: 'finish', reason: { kind: 'error', failure: { code: 'AUTH', status: 401, message: 'invalid api key' } } },
+]
+
+const stream = (chunks) => () =>
+  (async function* replay() {
+    for (const chunk of chunks) yield chunk
+  })()
+
+const OPTIONS = { provider: 'ecnu', model: 'ecnu-max', sessionId: 'root-session', messages: [] }
+
+/** Boot one harness, seed a pool, and hand back the pieces each test needs. */
+async function boot({ mode = 'passive', stateDir } = {}) {
+  // Every boot gets its own state directory unless a test explicitly reuses one,
+  // so a harness never inherits keys whose secrets live in another harness.
+  process.env.DSH_MULTI_KEY_STATE_DIR = stateDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'multi-key-state-'))
+  const harness = createHarness()
+  host.apply(harness.ctx)
+  harness.stateDir = process.env.DSH_MULTI_KEY_STATE_DIR
+  await harness.call('config', 'POST', { op: 'set-quota', mode })
+  return harness
+}
+
+async function addKeys(harness, count = 2) {
+  for (let index = 1; index <= count; index += 1) {
+    const result = await harness.call('config', 'POST', {
+      op: 'add-provider-key',
+      provider: 'ecnu',
+      note: `key ${index}`,
+      value: `sk-secret-value-${index}00000000`,
+    })
+    assert.equal(result.body.ok, true, JSON.stringify(result.body))
+  }
+}
+
+test('the plugin registers its listeners, routes and a state file', async () => {
+  const harness = await boot()
+  try {
+    for (const name of ['llm/stream', 'llm-pi-ai/request-headers', 'agent/request-error']) {
+      assert.ok(harness.listener(name), name)
+    }
+    for (const suffix of ['status', 'config', 'probe', 'selftest']) {
+      assert.ok(harness.routes.has(`/api/multi-key-orchestrator/${suffix}`), suffix)
+    }
+    const status = await harness.call('status', 'GET')
+    assert.equal(status.code, 200)
+    assert.equal(status.body.status.enabled, false)
+    assert.equal(status.body.status.pools.length, 0)
+    assert.equal(status.body.status.credentials.available, true)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('with the toggle off the stream is handed through untouched', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness)
+    const streamListener = harness.listener('llm/stream')
+    const chunks = await collect(streamListener(OPTIONS, stream(SUCCESS)))
+    assert.deepEqual(chunks, SUCCESS)
+    const status = await harness.call('status', 'GET')
+    assert.equal(status.body.status.correlation.leases, 0, 'a disabled plugin must never lease a key')
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('two keys create a pool whose cap is derived from the key count', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    const status = await harness.call('status', 'GET')
+    const pool = status.body.status.pools[0]
+    assert.equal(pool.provider, 'ecnu')
+    assert.equal(pool.model, 'ecnu-max')
+    assert.equal(pool.maxConcurrent, 6, '3 concurrent requests per key times 2 keys')
+    assert.equal(pool.reservedForMain, 1)
+    assert.equal(pool.lane.childCapacity, 5)
+    assert.equal(pool.keys.length, 2)
+    for (const key of pool.keys) {
+      assert.equal(key.maskedLabel, '••••••', 'the mask is constant: no key characters are ever rendered')
+      assert.equal(key.ref, undefined, 'the credential ref is not part of the wire shape')
+      assert.ok(typeof key.note === 'string' && key.note.length > 0, 'each key carries a note')
+      assert.equal(key.maxConcurrent, 0, 'a per-key cap defaults to inheriting the pool cap')
+    }
+    assert.ok(!JSON.stringify(status.body).includes('sk-secret-value-1'), 'no secret may appear in status')
+    const stateFile = path.join(harness.stateDir, 'state.json')
+    const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'))
+    // Keys belong to the provider now, so the file keeps one list per provider.
+    assert.equal(saved.providers.ecnu.keys.length, 2)
+    assert.equal(saved.pools.length, 2, 'two keys open a pool per model the provider owns')
+    assert.ok(!JSON.stringify(saved).includes('sk-secret-value-1'), 'the state file stores refs, not secrets')
+    assert.equal(harness.credentialStore.size, 2)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a pooled request swaps the auth header to the leased key secret', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    const headerListener = harness.listener('llm-pi-ai/request-headers')
+
+    // Drive the stream far enough to observe the header preparation the way the
+    // pi-ai adapter would: inside the same call, before tokens arrive.
+    let headerResult
+    const next = () => {
+      const headers = new Headers({ authorization: 'Bearer native-single-key', 'x-request-id': 'r1' })
+      headerListener(
+        { provider: 'ecnu', model: 'ecnu-max', sessionId: 'root-session', purpose: undefined, baseURL: 'https://chat.ecnu.edu.cn/open/api/v1' },
+        headers,
+        () => headers,
+      )
+      headerResult = headers.get('authorization')
+      return (async function* replay() {
+        for (const chunk of SUCCESS) yield chunk
+      })()
+    }
+    const chunks = await collect(streamListener(OPTIONS, next))
+    assert.equal(chunks.at(-1).type, 'finish')
+    assert.ok(
+      ['Bearer sk-secret-value-100000000', 'Bearer sk-secret-value-200000000'].includes(headerResult),
+      `unexpected authorization header: ${headerResult}`,
+    )
+    const status = await harness.call('status', 'GET')
+    assert.equal(status.body.status.correlation.swaps, 1)
+    assert.equal(status.body.status.correlation.leases, 1)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a pre-content 429 rotates to the other key and the consumer sees one clean answer', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    let calls = 0
+    const next = () => {
+      calls += 1
+      return stream(calls === 1 ? RATE_LIMIT : SUCCESS)()
+    }
+    const chunks = await collect(streamListener(OPTIONS, next))
+    assert.equal(calls, 2, 'the failing attempt was retried on a different key')
+    assert.equal(chunks.filter((chunk) => chunk.type === 'finish').length, 1, 'exactly one finish reaches the consumer')
+    assert.deepEqual(chunks, SUCCESS, 'the failed attempt emitted nothing')
+    const status = await harness.call('status', 'GET')
+    const cooling = status.body.status.pools[0].keys.find((key) => key.state === 'cooldown')
+    assert.ok(cooling, 'the offending key is cooling')
+    assert.ok(cooling.cooldownUntil - Date.now() <= 15_000, 'cooldown came from Retry-After, not a fixed hour')
+    assert.ok(status.body.status.log.some((entry) => entry.action === 'cooldown'))
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a 401 is surfaced without rotating the key', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    let calls = 0
+    const next = () => {
+      calls += 1
+      return stream(BAD_KEY)()
+    }
+    const chunks = await collect(streamListener(OPTIONS, next))
+    assert.equal(calls, 1, 'a structural failure must not be retried')
+    assert.equal(chunks.at(-1).reason.failure.status, 401)
+    const status = await harness.call('status', 'GET')
+    assert.ok(status.body.status.pools[0].keys.every((key) => key.state !== 'cooldown'), 'no key was parked')
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a spent balance refuses the request instead of calling the provider', async () => {
+  biller.remaining = 0
+  const harness = await boot({ mode: 'active' })
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    let called = false
+    const next = () => {
+      called = true
+      return stream(SUCCESS)()
+    }
+    const chunks = await collect(streamListener(OPTIONS, next))
+    assert.equal(called, false, 'an exhausted pool must not spend a request')
+    assert.equal(chunks.at(-1).reason.failure.code, 'MULTI_KEY_POOL_EXHAUSTED')
+  } finally {
+    biller.remaining = 900
+    harness.dispose()
+  }
+})
+
+test('a mid-stream 429 is handed to the loop as a retry and the partial text is drained', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    const requestError = harness.listener('agent/request-error')
+
+    const chunks = await collect(streamListener(OPTIONS, stream(MID_STREAM_429)))
+    assert.equal(chunks[0].text, 'partial answer', 'already-emitted content reaches the consumer and is discarded by the loop')
+    assert.equal(chunks.at(-1).reason.kind, 'error')
+
+    const action = requestError(
+      { agent: { id: 'root-session' }, turn: 1, step: 1, provider: 'ecnu', failure: {}, retryPolicy: undefined },
+      () => undefined,
+    )
+    assert.deepEqual(action, { kind: 'retry' }, 'the plugin took ownership of the recovery')
+
+    const status = await harness.call('status', 'GET')
+    assert.ok(status.body.status.log.some((entry) => entry.action === 'midstream-retry'))
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a mid-stream 429 is not retried once the retry budget is spent', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    await harness.call('config', 'POST', { op: 'set-retry', midStreamRetry: true, midStreamMaxRetries: 0 })
+    const streamListener = harness.listener('llm/stream')
+    const requestError = harness.listener('agent/request-error')
+    await collect(streamListener(OPTIONS, stream(MID_STREAM_429)))
+    let delegated = false
+    const action = requestError(
+      { agent: { id: 'root-session' }, provider: 'ecnu', failure: {} },
+      () => {
+        delegated = true
+        return undefined
+      },
+    )
+    assert.equal(delegated, true)
+    assert.equal(action, undefined)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('the self-test reports the reserved slot and a draining FIFO', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    const result = await harness.call('selftest', 'POST', { concurrency: 8 })
+    assert.equal(result.body.ok, true, JSON.stringify(result.body))
+    const summary = result.body.summary
+    assert.equal(summary.maxConcurrent, 6)
+    assert.equal(summary.childCapacity, 5)
+    assert.equal(summary.peak.total, 6, 'the pool ran at its cap')
+    assert.equal(summary.peak.child, 5, 'children filled exactly their lane')
+    assert.equal(summary.peak.main, 1, 'the main process held the reserved slot')
+    assert.equal(summary.waitingAtMidway, 3, 'the three overflow children queued')
+    assert.equal(summary.granted, 9, 'every queued child was eventually granted once slots drained')
+    assert.equal(summary.mainGranted, 1)
+    assert.equal(summary.failures.length, 0)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a cooling key is excluded from the self-test allocation', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    const result = await harness.call('selftest', 'POST', { concurrency: 4, inject429: 'first' })
+    assert.equal(result.body.ok, true)
+    assert.ok(result.body.log.some((entry) => entry.action === 'cooldown'), 'the injected 429 parked a key')
+    assert.ok(result.body.summary.childGranted >= 1)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('turning the toggle off restores the pass-through path', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    await harness.call('config', 'POST', { op: 'toggle', enabled: false })
+    const streamListener = harness.listener('llm/stream')
+    const before = (await harness.call('status', 'GET')).body.status.correlation.leases
+    const chunks = await collect(streamListener(OPTIONS, stream(SUCCESS)))
+    assert.deepEqual(chunks, SUCCESS)
+    const after = (await harness.call('status', 'GET')).body.status.correlation.leases
+    assert.equal(after, before, 'no key is leased while disabled')
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('state survives a restart of the plugin', async () => {
+  const first = await boot()
+  const sharedDir = first.stateDir
+  await addKeys(first, 2)
+  await first.call('config', 'POST', { op: 'toggle', enabled: true })
+  const firstStatus = await first.call('status', 'GET')
+  first.dispose()
+
+  const second = await boot({ stateDir: sharedDir })
+  try {
+    const status = await second.call('status', 'GET')
+    assert.equal(status.body.status.enabled, true, 'the toggle survived a reload')
+    assert.equal(status.body.status.pools.length, firstStatus.body.status.pools.length)
+    assert.equal(status.body.status.pools[0].keys.length, 2)
+    assert.equal(status.body.status.pools[0].maxConcurrent, 6)
+  } finally {
+    second.dispose()
+  }
+})
+
+test('an unknown op is reported instead of silently ignored', async () => {
+  const harness = await boot()
+  try {
+    const result = await harness.call('config', 'POST', { op: 'not-a-real-op' })
+    assert.equal(result.body.ok, false)
+    assert.match(result.body.error, /unknown op/)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('the catalog lists the providers and models the profile declares', async () => {
+  const harness = await boot()
+  try {
+    const status = await harness.call('status', 'GET')
+    const catalog = status.body.status.catalog
+    assert.ok(Array.isArray(catalog), 'status must expose a catalog')
+    assert.ok(catalog.length > 0, 'the settings entry provided no provider to show')
+    const ecnu = catalog.find((entry) => entry.provider === 'ecnu')
+    assert.ok(ecnu, 'the declared provider is missing from the catalog')
+    assert.equal(ecnu.displayName, 'ECNU')
+    assert.equal(ecnu.baseURL, 'https://chat.ecnu.edu.cn/open/api/v1')
+    assert.deepEqual(
+      ecnu.models.map((model) => model.id),
+      ['ecnu-max', 'ecnu-plus'],
+      'every model declared in settings must be listed without the user typing it',
+    )
+    for (const entry of catalog) {
+      assert.ok(typeof entry.provider === 'string' && entry.provider.length > 0)
+      assert.ok(typeof entry.displayName === 'string')
+      assert.ok(Array.isArray(entry.models))
+    }
+    const providers = status.body.status.providers
+    assert.ok(Array.isArray(providers))
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a provider-wide cap is stored and reported', async () => {
+  const harness = await boot()
+  try {
+    const saved = await harness.call('config', 'POST', { op: 'set-provider', provider: 'ecnu', maxConcurrent: 2 })
+    assert.equal(saved.body.ok, true, JSON.stringify(saved.body))
+    const status = await harness.call('status', 'GET')
+    const entry = status.body.status.providers.find((row) => row.provider === 'ecnu')
+    assert.ok(entry, 'the provider cap must be reported even without a pool')
+    assert.equal(entry.maxConcurrent, 2)
+    assert.equal(entry.activeLeases, 0)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a model cap can be set before any key exists', async () => {
+  const harness = await boot()
+  try {
+    // A manual total needs the link switch off: while linked, the total is the
+    // sum of the per-API caps and a typed number would be overwritten.
+    const saved = await harness.call('config', 'POST', {
+      op: 'set-pool',
+      provider: 'ecnu',
+      model: 'ecnu-max',
+      maxConcurrent: 9,
+      linked: false,
+    })
+    assert.equal(saved.body.ok, true, JSON.stringify(saved.body))
+    const pool = (await harness.call('status', 'GET')).body.status.pools[0]
+    assert.equal(pool.maxConcurrent, 9)
+    assert.equal(pool.keys.length, 0)
+    assert.equal(pool.linked, false)
+    assert.equal(pool.maxConcurrentAuto, false)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a provider key keeps a note and a per-model concurrency cap', async () => {
+  const harness = await boot()
+  try {
+    await harness.call('config', 'POST', {
+      op: 'add-provider-key',
+      provider: 'ecnu',
+      note: 'work account',
+      value: 'sk-secret-value-100000000',
+    })
+    const saved = await harness.call('config', 'POST', {
+      op: 'update-provider-key',
+      provider: 'ecnu',
+      keyId: 'k1',
+      note: 'personal account',
+    })
+    assert.equal(saved.body.ok, true, JSON.stringify(saved.body))
+    const providerKey = (await harness.call('status', 'GET')).body.status.providers.find(
+      (row) => row.provider === 'ecnu',
+    ).keys[0]
+    assert.equal(providerKey.note, 'personal account', 'the note is renamed at provider level')
+    assert.equal(providerKey.maskedLabel, '••••••')
+    assert.equal(providerKey.source, 'added')
+
+    // One provider key, one different cap per model.
+    const capped = await harness.call('config', 'POST', {
+      op: 'set-key-cap',
+      provider: 'ecnu',
+      model: 'ecnu-max',
+      keyId: 'k1',
+      maxConcurrent: 2,
+    })
+    assert.equal(capped.body.ok, true, JSON.stringify(capped.body))
+    const status = await harness.call('status', 'GET')
+    const pool = status.body.status.pools.find((row) => row.model === 'ecnu-max')
+    assert.equal(pool.keys[0].maxConcurrent, 2, 'the cap belongs to this model')
+    const plus = status.body.status.pools.find((row) => row.model === 'ecnu-plus')
+    assert.equal(plus?.keys[0]?.maxConcurrent ?? 0, 0, 'a different model keeps its own cap')
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('the status route never probes the biller', async () => {
+  const harness = await boot({ mode: 'active' })
+  try {
+    await addKeys(harness, 2)
+    // Let the add-key probes settle, then freeze the cache and prove that
+    // repeated status reads do not move it.
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const first = await harness.call('status', 'GET')
+    const checkedAt = first.body.status.pools[0].keys.map((key) => key.quota?.checkedAt)
+    for (let index = 0; index < 5; index += 1) await harness.call('status', 'GET')
+    const after = await harness.call('status', 'GET')
+    assert.deepEqual(
+      after.body.status.pools[0].keys.map((key) => key.quota?.checkedAt),
+      checkedAt,
+      'GET /status must be a pure cache read',
+    )
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a request that dies mid-flight gives its lease back', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+
+    const before = (await harness.call('status', 'GET')).body.status.pools.find((row) => row.model === 'ecnu-max')
+    assert.equal(before.lane.total, 0)
+
+    // The upstream explodes instead of finishing: the lease must not stay held,
+    // otherwise a crashed agent would quietly shrink the pool forever.
+    const broken = () =>
+      (async function* explode() {
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        throw new Error('socket hung up')
+      })()
+    await collect(streamListener({ ...OPTIONS }, broken)).catch(() => [])
+
+    const after = (await harness.call('status', 'GET')).body.status.pools.find((row) => row.model === 'ecnu-max')
+    assert.equal(after.lane.total, 0, 'the dead request leaked its lease')
+    for (const key of after.keys) assert.equal(key.activeLeases, 0, `${key.id} still holds a lease`)
+
+    // And the pool still serves the next request on a key.
+    const chunks = await collect(streamListener({ ...OPTIONS }, stream(SUCCESS)))
+    assert.equal(chunks.at(-1).type, 'finish')
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('one conversation rotates through every key, request after request', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 3)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    const headerListener = harness.listener('llm-pi-ai/request-headers')
+
+    /** @type {string[]} */
+    const used = []
+    const keyOf = (authorization) => {
+      for (const [keyId, secret] of harness.credentialStore) {
+        if (authorization === `Bearer ${secret}`) return keyId
+      }
+      return undefined
+    }
+
+    // Strictly sequential: one main-lane request at a time, like a chat turn.
+    for (let index = 0; index < 6; index += 1) {
+      const next = () => {
+        const headers = new Headers({ authorization: 'Bearer native-single-key' })
+        headerListener(
+          { provider: 'ecnu', model: 'ecnu-max', sessionId: 'root-session', purpose: undefined, baseURL: 'https://chat.ecnu.edu.cn/open/api/v1' },
+          headers,
+          () => headers,
+        )
+        const keyId = keyOf(headers.get('authorization'))
+        assert.ok(keyId, 'the request was not routed through the pool')
+        used.push(keyId)
+        return (async function* replay() {
+          for (const chunk of SUCCESS) yield chunk
+        })()
+      }
+      await collect(streamListener({ ...OPTIONS }, next))
+    }
+
+    assert.equal(used.length, 6)
+    // Six sequential requests over three keys must be 2/2/2, not 6/0/0.
+    const counts = new Map()
+    for (const keyId of used) counts.set(keyId, (counts.get(keyId) ?? 0) + 1)
+    assert.equal(counts.size, 3, `only ${counts.size} key(s) were used: ${JSON.stringify([...counts])}`)
+    for (const [keyId, count] of counts) assert.equal(count, 2, `${keyId} served ${count} of 6 sequential requests`)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('concurrent traffic spreads evenly and never exceeds either cap', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 3)
+    // Two leases per key, so the model total (linked) is 6.
+    for (const keyId of ['k1', 'k2', 'k3']) {
+      const saved = await harness.call('config', 'POST', {
+        op: 'set-key-cap',
+        provider: 'ecnu',
+        model: 'ecnu-max',
+        keyId,
+        maxConcurrent: 2,
+      })
+      assert.equal(saved.body.ok, true, JSON.stringify(saved.body))
+    }
+    const pool = (await harness.call('status', 'GET')).body.status.pools.find((row) => row.model === 'ecnu-max')
+    assert.equal(pool.maxConcurrent, 6, 'three keys at two leases each')
+    assert.equal(pool.linked, true)
+
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    const headerListener = harness.listener('llm-pi-ai/request-headers')
+
+    /** @type {Map<string, number>} */
+    const inFlight = new Map()
+    /** @type {Map<string, number>} */
+    const served = new Map()
+    let peakTotal = 0
+    let peakPerKey = 0
+
+    const secretOwner = (authorization) => {
+      for (const [keyId, secret] of harness.credentialStore) {
+        if (authorization === `Bearer ${secret}`) return keyId
+      }
+      return undefined
+    }
+
+    const oneRequest = async () => {
+      const next = () => {
+        const headers = new Headers({ authorization: 'Bearer native-single-key' })
+        headerListener(
+          { provider: 'ecnu', model: 'ecnu-max', sessionId: 's1', purpose: undefined, baseURL: 'https://chat.ecnu.edu.cn/open/api/v1' },
+          headers,
+          () => headers,
+        )
+        const keyId = secretOwner(headers.get('authorization'))
+        assert.ok(keyId, `the header was not replaced with a pooled secret: ${headers.get('authorization')}`)
+        assert.ok(harness.credentialStore.has(keyId), 'the leased key must exist in the credential store')
+        const running = (inFlight.get(keyId) ?? 0) + 1
+        inFlight.set(keyId, running)
+        peakPerKey = Math.max(peakPerKey, running)
+        const total = [...inFlight.values()].reduce((sum, value) => sum + value, 0)
+        peakTotal = Math.max(peakTotal, total)
+        served.set(keyId, (served.get(keyId) ?? 0) + 1)
+        return (async function* replay() {
+          try {
+            for (const chunk of SUCCESS) {
+              await new Promise((resolve) => setTimeout(resolve, 15))
+              yield chunk
+            }
+          } finally {
+            inFlight.set(keyId, (inFlight.get(keyId) ?? 1) - 1)
+          }
+        })()
+      }
+      return collect(streamListener({ ...OPTIONS }, next))
+    }
+
+    const results = await Promise.all(Array.from({ length: 12 }, () => oneRequest()))
+    for (const chunks of results) assert.equal(chunks.at(-1).type, 'finish')
+
+    const totalServed = [...served.values()].reduce((sum, value) => sum + value, 0)
+    assert.equal(totalServed, 12, 'every request reached a key')
+    assert.equal(served.size, 3, 'all three keys took part')
+    assert.ok(peakTotal <= 6, `the pool total was exceeded: ${peakTotal}`)
+    assert.ok(peakPerKey <= 2, `a per-key cap was exceeded: ${peakPerKey}`)
+
+    // "Roughly even": 12 requests over 3 keys is 4 each; allow one in flight.
+    for (const [keyId, count] of served) {
+      assert.ok(count >= 3 && count <= 5, `${keyId} served ${count} of 12 requests`)
+    }
+  } finally {
+    harness.dispose()
+  }
+})

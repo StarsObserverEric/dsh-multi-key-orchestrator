@@ -1,0 +1,3 @@
+# Runtime state written by the plugin (toggle, pools, concurrency caps).
+# Secrets never live here; they go to the profile credential store.
+.state/

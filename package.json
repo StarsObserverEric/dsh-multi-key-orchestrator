@@ -1,0 +1,75 @@
+{
+  "name": "@starsobservereric/dsh-multi-key-orchestrator",
+  "version": "0.4.0",
+  "type": "module",
+  "description": "Spread one conversation's requests across several API keys of the same provider, cap concurrency per provider / model / key with a slot reserved for the main process, recover from HTTP 429 by rotating keys, and show each key's remaining balance.",
+  "license": "MIT",
+  "icon": "./icon.svg",
+  "author": {
+    "name": "StarsObserverEric",
+    "url": "https://github.com/StarsObserverEric"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/StarsObserverEric/dsh-multi-key-orchestrator.git"
+  },
+  "homepage": "https://github.com/StarsObserverEric/dsh-multi-key-orchestrator#readme",
+  "bugs": {
+    "url": "https://github.com/StarsObserverEric/dsh-multi-key-orchestrator/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "api-key",
+    "key-pool",
+    "load-balancing",
+    "rate-limit",
+    "concurrency"
+  ],
+  "meta": {
+    "title": "Multi-Key Orchestrator",
+    "description": "Give one provider several API keys. Requests are spread across them by a lease, per-provider / per-model / per-key caps keep the total under control while one slot stays free for the main process, a 429 parks only the offending key and rotates to a healthy one, and every key carries a live balance card read from the provider's own quota endpoint."
+  },
+  "exports": {
+    ".": "./host.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "host.js",
+    "engine.js",
+    "quota.js",
+    "state.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/en.json",
+    "locale/zh.json",
+    "icon.svg",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "docs/quota-contract.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

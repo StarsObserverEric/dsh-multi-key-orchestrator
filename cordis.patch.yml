@@ -1,0 +1,8 @@
+# Bundle patch for @starsobservereric/dsh-multi-key-orchestrator.
+# One Host row: the pool engine, the two llm wateralls and the panel/status routes.
+# The row carries no `config`: all persistent state lives in the plugin's own
+# state file (see README, "Where the state lives"), so editing it never restarts
+# the plugin and never rewrites the user's profile patch.
+- insert:
+    - id: multi-key-orchestrator
+      name: "@starsobservereric/dsh-multi-key-orchestrator"
