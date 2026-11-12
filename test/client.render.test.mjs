@@ -432,7 +432,7 @@ async function expandPage() {
 
 test('the module registers only the navigation entry and the page', () => {
   assert.ok(captured, 'client.js did not call window.__ModuleLoader__.load')
-  assert.equal(captured.id, '@starsobservereric/dsh-multi-key-orchestrator')
+  assert.equal(captured.id, '@stars_observer_eric/dsh-multi-key-orchestrator')
   const { module } = applyClient()
   assert.deepEqual(module.inject, ['slots', 'locale'])
   assert.equal(registrations.get(NAV)?.options.order, 21, 'the entry sits under Context Insights (order 20)')

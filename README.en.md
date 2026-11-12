@@ -67,7 +67,7 @@ dsh plugin --profile desktop add github:StarsObserverEric/dsh-multi-key-orchestr
 **From npm**
 
 ```sh
-dsh plugin --profile desktop add @starsobservereric/dsh-multi-key-orchestrator
+dsh plugin --profile desktop add @stars_observer_eric/dsh-multi-key-orchestrator
 ```
 
 **From a local directory**
@@ -81,7 +81,7 @@ Then **quit DSH completely and start it again**. The host half is loaded at proc
 Uninstall:
 
 ```sh
-dsh plugin --profile desktop remove @starsobservereric/dsh-multi-key-orchestrator
+dsh plugin --profile desktop remove @stars_observer_eric/dsh-multi-key-orchestrator
 ```
 
 Turning the plugin off never touches your keys or your model configuration; it just returns DSH to its normal single-key behaviour.

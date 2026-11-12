@@ -30,7 +30,7 @@
  * only where a status has to be encoded (green / amber / red / grey).
  */
 window.__ModuleLoader__.load({
-  id: '@starsobservereric/dsh-multi-key-orchestrator',
+  id: '@stars_observer_eric/dsh-multi-key-orchestrator',
   factory(require) {
     const React = require('react')
     const h = React.createElement

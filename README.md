@@ -69,7 +69,7 @@ dsh plugin --profile desktop add github:StarsObserverEric/dsh-multi-key-orchestr
 **从 npm 安装**
 
 ```sh
-dsh plugin --profile desktop add @starsobservereric/dsh-multi-key-orchestrator
+dsh plugin --profile desktop add @stars_observer_eric/dsh-multi-key-orchestrator
 ```
 
 **从本地文件夹安装**
@@ -83,7 +83,7 @@ dsh plugin --profile desktop add /你的路径/dsh-multi-key-orchestrator
 卸载：
 
 ```sh
-dsh plugin --profile desktop remove @starsobservereric/dsh-multi-key-orchestrator
+dsh plugin --profile desktop remove @stars_observer_eric/dsh-multi-key-orchestrator
 ```
 
 关掉插件不会动你的 Key 和模型配置，只是回到 DSH 原生的单 Key 行为。

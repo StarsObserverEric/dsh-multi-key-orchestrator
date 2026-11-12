@@ -1,5 +1,5 @@
 {
-  "name": "@starsobservereric/dsh-multi-key-orchestrator",
+  "name": "@stars_observer_eric/dsh-multi-key-orchestrator",
   "version": "0.4.0",
   "type": "module",
   "description": "Spread one conversation's requests across several API keys of the same provider, cap concurrency per provider / model / key with a slot reserved for the main process, recover from HTTP 429 by rotating keys, and show each key's remaining balance.",
