@@ -35,6 +35,8 @@ function createHarness() {
   const routes = new Map()
   const disposers = []
   const credentialStore = new Map()
+  /** sessionId -> SessionHeader, for the main/child lane decision. */
+  const sessionHeaders = new Map()
 
   const credentials = {
     async set(ref, value) {
@@ -67,6 +69,13 @@ function createHarness() {
     },
     get(name) {
       if (name === 'credentials') return credentials
+      // The lane decision reads the session header, which is the only place the
+      // parentage of a delegated session is recorded.
+      if (name === 'sessions') {
+        return {
+          get: (id) => (sessionHeaders.has(id) ? { header: sessionHeaders.get(id) } : undefined),
+        }
+      }
       // The profile declares its providers in the llm-pi-ai settings entry, which
       // is exactly what the panel catalog is supposed to read.
       if (name === 'settings') {
@@ -160,6 +169,7 @@ function createHarness() {
     ctx,
     routes,
     credentialStore,
+    sessions: sessionHeaders,
     listener,
     call,
     dispose() {
@@ -816,6 +826,87 @@ test('concurrent traffic spreads evenly and never exceeds either cap', async () 
     for (const [keyId, count] of served) {
       assert.ok(count >= 3 && count <= 5, `${keyId} served ${count} of 12 requests`)
     }
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a 429 thrown by the adapter is cooled and rotated like a yielded one', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    let calls = 0
+    const next = () => {
+      calls += 1
+      if (calls === 1) {
+        // A transport-level failure: the adapter raises instead of yielding a
+        // finish chunk. Before the pool caught it, this escaped untouched and
+        // the key was neither cooled nor rotated.
+        return (async function* boom() {
+          throw Object.assign(new Error('429 model_concurrency_exceeded: max_concurrency 5, active 5'), { status: 429 })
+        })()
+      }
+      return stream(SUCCESS)()
+    }
+    const chunks = await collect(streamListener(OPTIONS, next))
+    assert.equal(calls, 2, 'the throwing attempt was retried on another key')
+    assert.deepEqual(chunks, SUCCESS, 'the consumer sees one clean answer')
+    const status = await harness.call('status', 'GET')
+    assert.equal(status.body.status.log.filter((entry) => entry.action === 'cooldown').length, 1)
+    assert.equal(status.body.status.pools[0].keys.filter((key) => key.state === 'cooldown').length, 1)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a thrown 429 is recognised from the message when no status is attached', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    let calls = 0
+    const next = () => {
+      calls += 1
+      if (calls === 1) {
+        return (async function* boom() {
+          throw new Error('HTTP 429: model_concurrency_exceeded')
+        })()
+      }
+      return stream(SUCCESS)()
+    }
+    const chunks = await collect(streamListener(OPTIONS, next))
+    assert.equal(calls, 2)
+    assert.deepEqual(chunks, SUCCESS)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a delegated session is charged to the child lane, a root session to main', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    harness.sessions.set('root-session', { id: 'root-session', isSeeded: false })
+    harness.sessions.set('child-session', {
+      id: 'child-session',
+      isSeeded: true,
+      parentSession: 'root-session',
+      origin: 'subagent',
+      delegationDepth: 1,
+    })
+    const streamListener = harness.listener('llm/stream')
+    await collect(streamListener(OPTIONS, stream(SUCCESS)))
+    await collect(streamListener({ ...OPTIONS, sessionId: 'child-session' }, stream(SUCCESS)))
+    const status = await harness.call('status', 'GET')
+    const lanes = status.body.status.log
+      .filter((entry) => entry.action === 'acquire')
+      .map((entry) => entry.lane)
+      .sort()
+    assert.deepEqual(lanes, ['child', 'main'], `lanes were ${JSON.stringify(lanes)}`)
   } finally {
     harness.dispose()
   }

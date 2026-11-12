@@ -699,9 +699,15 @@ export function apply(ctx) {
 
   /**
    * Which lane a request belongs to.
-   * Any failure to prove this session is a root yields the configured
-   * fallback — `child` by default, so an unidentifiable request can never
-   * steal the slot reserved for the main process.
+   *
+   * The session header is the only reliable evidence: a delegated session
+   * carries the parent it was forked from, the `subagent` origin, or a
+   * delegation depth. `ctx.agents` cannot answer this — its `Agent` is nothing
+   * but an id, and its registry exposes no parentage — so a lookup there would
+   * classify every session, children included, as main.
+   *
+   * Any failure to read the header yields the configured fallback (`child` by
+   * default), so an unidentifiable request can never steal the main slot.
    * @param {string | undefined} sessionId
    */
   function laneOf(sessionId) {
@@ -710,27 +716,20 @@ export function apply(ctx) {
       stats.fallbackLane += 1
       return fallback
     }
-    const agents = (() => {
+    const header = (() => {
       try {
-        return ctx.get('agents')
+        const sessions = ctx.get('sessions')
+        return typeof sessions?.get === 'function' ? sessions.get(sessionId)?.header : undefined
       } catch {
         return undefined
       }
     })()
-    if (!agents) {
-      stats.fallbackLane += 1
-      return fallback
-    }
-    try {
-      const roots = typeof agents.roots === 'function' ? agents.roots() : []
-      for (const root of roots) {
-        if (root?.id === sessionId) return 'main'
-        if (typeof agents.isOwnedBy === 'function' && agents.isOwnedBy(sessionId, root)) return 'child'
-      }
-      const agent = typeof agents.get === 'function' ? agents.get(sessionId) : undefined
-      if (agent) return 'main'
-    } catch {
-      /* fall through to the conservative answer */
+    if (header) {
+      const delegated =
+        header.parentSession != null ||
+        header.origin === 'subagent' ||
+        Number(header.delegationDepth ?? 0) > 0
+      return delegated ? 'child' : 'main'
     }
     stats.fallbackLane += 1
     return fallback
@@ -745,6 +744,30 @@ export function apply(ctx) {
   })
 
   /**
+   * Normalise a thrown adapter error into the `LlmFailure` shape the classifier
+   * reads. A thrown error usually carries no `status`, but the message almost
+   * always names the HTTP code ("429 model_concurrency_exceeded ..."), so the
+   * code is recovered from it — otherwise a thrown 429 would be classified as
+   * "other" and escape the pool without cooling or rotating its key.
+   * @param {any} error
+   */
+  function failureFromError(error) {
+    const message = String(error?.message ?? error ?? 'model request failed')
+    const declared = Number(
+      error?.status ?? error?.statusCode ?? error?.response?.status ?? error?.cause?.status ?? 0,
+    )
+    const status = Number.isFinite(declared) && declared > 0
+      ? declared
+      : (/(?:^|\D)4(\d\d)(?:\D|$)/.exec(message)?.[1] === '29' ? 429 : undefined)
+    return {
+      code: String(error?.code ?? (status ? `HTTP_${status}` : 'REQUEST_FAILED')),
+      message,
+      status,
+      providerRetryAfterMs: Number(error?.providerRetryAfterMs ?? error?.retryAfterMs ?? 0) || undefined,
+    }
+  }
+
+  /**
    * Run one attempt against one leased key.
    *
    * Content chunks are buffered until the first content delta, so a key that
@@ -757,24 +780,36 @@ export function apply(ctx) {
     let contentStarted = false
     let emittedChars = 0
     let finish
+    let thrown
     const scope = { keyId: lease.keyId, secret }
     const iterable = als.run(scope, () => next())
-    for await (const chunk of iterable) {
-      if (!chunk || typeof chunk !== 'object') continue
-      if (chunk.type === 'finish') {
-        finish = chunk
-        break
+    try {
+      for await (const chunk of iterable) {
+        if (!chunk || typeof chunk !== 'object') continue
+        if (chunk.type === 'finish') {
+          finish = chunk
+          break
+        }
+        const isContent =
+          chunk.type === 'text-delta' || chunk.type === 'reasoning-delta' || chunk.type === 'tool-call-delta'
+        if (chunk.type === 'text-delta') emittedChars += String(chunk.text ?? '').length
+        if (!contentStarted && isContent) {
+          contentStarted = true
+          for (const held of buffered) yield held
+          buffered.length = 0
+        }
+        if (contentStarted) yield chunk
+        else buffered.push(chunk)
       }
-      const isContent =
-        chunk.type === 'text-delta' || chunk.type === 'reasoning-delta' || chunk.type === 'tool-call-delta'
-      if (chunk.type === 'text-delta') emittedChars += String(chunk.text ?? '').length
-      if (!contentStarted && isContent) {
-        contentStarted = true
-        for (const held of buffered) yield held
-        buffered.length = 0
-      }
-      if (contentStarted) yield chunk
-      else buffered.push(chunk)
+    } catch (error) {
+      // The adapter threw instead of yielding a `finish` chunk. Classify it the
+      // same way, so the caller can still cool the key and move to another one.
+      const failure = failureFromError(error)
+      const classified = classifyFailure(failure, {
+        quotaPatterns: state.classify.quotaPatterns,
+        transientPatterns: state.classify.transientPatterns,
+      })
+      return { kind: 'failure', failure, classified, aborted: false, contentStarted, emittedChars, thrown: error }
     }
 
     if (!finish) {
@@ -916,12 +951,18 @@ export function apply(ctx) {
         return
       }
 
-      const { failure, classified, aborted, contentStarted, emittedChars } = result
+      const { failure, classified, aborted, contentStarted, emittedChars, thrown } = result
       const actionable = !aborted && (classified.kind === 'transient' || classified.kind === 'quota')
 
       if (actionable) applyPenalty(poolState, lease.keyId, failure, classified)
 
-      if (!actionable) return
+      if (!actionable) {
+        // Nothing another key could fix (bad request, auth, unknown transport
+        // failure): hand it up exactly as the adapter raised it, so the error a
+        // user sees is the provider's own.
+        if (thrown !== undefined) throw thrown
+        return
+      }
 
       const after = gateSync(poolState)
       if (after.eligibleCount === 0) {
@@ -962,6 +1003,9 @@ export function apply(ctx) {
           at: Date.now(),
         })
       }
+      // A thrown attempt yielded no `finish` chunk, so close it here: the agent
+      // loop needs a termination reason before it can start the retry round.
+      if (thrown !== undefined) yield failureFinish(failure.code, failure.message)
       return
     }
 
@@ -1437,7 +1481,7 @@ export function apply(ctx) {
   const buildStatus = async () => {
     const catalog = await buildCatalog()
     return {
-    version: '0.4.0',
+    version: '0.4.1',
     enabled: state.enabled === true,
     startedAt,
     savedAt: lastSavedAt || undefined,
