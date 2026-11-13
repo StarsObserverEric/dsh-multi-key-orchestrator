@@ -258,14 +258,29 @@ function hostnameOfHost(host) {
 }
 
 /**
- * The request must be addressed to loopback, and a browser-attached Origin must
- * be loopback too. The Host check drops DNS-rebinding pages; a same-origin fetch
- * carries no Origin and passes on Host alone.
- * Borrowed from the community `dsh-ecnu-quota` plugin, which reaches the same
- * conclusion for its own read-only route.
+ * Every loopback form Node reports for a peer address: IPv4, IPv6, and the
+ * IPv4-mapped IPv6 form a dual-stack listener produces.
+ */
+const LOOPBACK_PEERS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
+
+/**
+ * Prove the caller is on this machine before it may touch stored API keys.
+ *
+ * The peer address decides, because it is the one part of the exchange the
+ * caller cannot write: `Host` and `Origin` are request headers, so a remote
+ * client can send `Host: 127.0.0.1` and pass a header-only check. The header
+ * checks stay as a second gate — they are what keeps a DNS-rebinding page from
+ * driving a loopback-hosted server — but they never decide alone.
+ *
+ * Failure is closed: a request whose socket exposes no peer address cannot be
+ * shown to be local, so it is refused instead of let through.
  * @param {import('node:http').IncomingMessage} request
  */
 function loopbackRequest(request) {
+  const socket = request?.socket ?? request?.connection
+  const remote = typeof socket?.remoteAddress === 'string' ? socket.remoteAddress.trim().toLowerCase() : ''
+  if (remote.length === 0) return false
+  if (!LOOPBACK_PEERS.has(remote)) return false
   const host = request.headers?.host
   if (typeof host !== 'string' || host.trim().length === 0) return false
   if (!LOOPBACK_HOSTS.has(hostnameOfHost(host))) return false
@@ -957,6 +972,16 @@ export function apply(ctx) {
       if (actionable) applyPenalty(poolState, lease.keyId, failure, classified)
 
       if (!actionable) {
+        // Record it anyway. A structural failure is the one case where the panel
+        // would otherwise stay silent, and "why did this turn die" is exactly
+        // what the activity log gets opened for.
+        record({
+          action: 'fail',
+          pool: `${provider}/${model}`,
+          key: lease.keyId,
+          lane,
+          detail: `${failure.code}${failure.status ? ` ${failure.status}` : ''} ${String(failure.message ?? '').slice(0, 160)}`,
+        })
         // Nothing another key could fix (bad request, auth, unknown transport
         // failure): hand it up exactly as the adapter raised it, so the error a
         // user sees is the provider's own.
@@ -1481,7 +1506,7 @@ export function apply(ctx) {
   const buildStatus = async () => {
     const catalog = await buildCatalog()
     return {
-    version: '0.4.1',
+    version: '0.4.2',
     enabled: state.enabled === true,
     startedAt,
     savedAt: lastSavedAt || undefined,

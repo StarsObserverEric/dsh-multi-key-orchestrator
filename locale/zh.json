@@ -140,6 +140,7 @@
     "quota.cny": "¥{amount} 余额",
     "quota.deepseekUnsupported": "这个服务方不提供可从这里读取的余额。",
     "common.unknownError": "未知错误",
-    "common.httpStatus": "HTTP {code}"
+    "common.httpStatus": "HTTP {code}",
+    "log.action.fail": "失败"
   }
 }

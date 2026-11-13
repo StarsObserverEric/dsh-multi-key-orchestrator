@@ -126,7 +126,7 @@ function createHarness() {
     return list[0]
   }
 
-  const call = (suffix, method, body) =>
+  const call = (suffix, method, body, overrides = {}) =>
     new Promise((resolve, reject) => {
       const route = routes.get(`/api/multi-key-orchestrator/${suffix}`)
       if (!route) {
@@ -137,8 +137,11 @@ function createHarness() {
       const request = {
         method,
         // A real browser call is loopback-addressed and same-origin; the route
-        // guard checks exactly that, so the fixture must look the same.
+        // guard checks exactly that, so the fixture must look the same — socket
+        // peer included, since the peer address is what decides.
         headers: { host: '127.0.0.1:13769', origin: 'http://127.0.0.1:13769' },
+        socket: { remoteAddress: '127.0.0.1', remotePort: 51999 },
+        ...overrides,
         on(event, handler) {
           handlers[event] = handlers[event] ?? []
           handlers[event].push(handler)
@@ -907,6 +910,68 @@ test('a delegated session is charged to the child lane, a root session to main',
       .map((entry) => entry.lane)
       .sort()
     assert.deepEqual(lanes, ['child', 'main'], `lanes were ${JSON.stringify(lanes)}`)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a structural failure is recorded as a fail entry instead of vanishing', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    const chunks = await collect(streamListener(OPTIONS, stream(BAD_KEY)))
+    const finish = chunks.at(-1)
+    assert.equal(finish.type, 'finish')
+    assert.equal(finish.reason.kind, 'error', 'the provider error reaches the consumer unchanged')
+    const status = await harness.call('status', 'GET')
+    const failed = status.body.status.log.filter((entry) => entry.action === 'fail')
+    assert.equal(failed.length, 1, 'exactly one fail entry')
+    assert.match(failed[0].detail, /AUTH/)
+    assert.match(failed[0].detail, /401/)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a route refuses a remote peer even when the headers claim loopback', async () => {
+  const harness = await boot()
+  try {
+    const remote = await harness.call('status', 'GET', undefined, {
+      socket: { remoteAddress: '203.0.113.9', remotePort: 41234 },
+    })
+    assert.equal(remote.code, 403, 'a spoofable Host header must not admit a remote peer')
+    assert.equal(remote.body.ok, false)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a route refuses a request whose connection cannot be inspected', async () => {
+  const harness = await boot()
+  try {
+    // Fail closed: no socket at all means "cannot prove this is local".
+    const noSocket = await harness.call('status', 'GET', undefined, { socket: undefined })
+    assert.equal(noSocket.code, 403)
+    const emptyPeer = await harness.call('config', 'POST', { op: 'toggle', enabled: true }, {
+      socket: { remoteAddress: '', remotePort: 1 },
+    })
+    assert.equal(emptyPeer.code, 403)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a route still accepts a loopback peer', async () => {
+  const harness = await boot()
+  try {
+    for (const peer of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
+      const ok = await harness.call('status', 'GET', undefined, {
+        socket: { remoteAddress: peer, remotePort: 51999 },
+      })
+      assert.equal(ok.code, 200, `${peer} should be admitted`)
+    }
   } finally {
     harness.dispose()
   }

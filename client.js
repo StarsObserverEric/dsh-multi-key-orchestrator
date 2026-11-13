@@ -163,6 +163,7 @@ window.__ModuleLoader__.load({
       'log.action.probe': 'probe',
       'log.action.no-seam': 'no-seam',
       'log.action.midstream-retry': 'mid-stream retry',
+      'log.action.fail': 'failed',
       'log.action.fallback-lane': 'fallback lane',
 
       'rollback.title': 'Rolling back',
@@ -315,6 +316,7 @@ window.__ModuleLoader__.load({
       'log.action.probe': '探测',
       'log.action.no-seam': '无接缝',
       'log.action.midstream-retry': '中途重试',
+      'log.action.fail': '失败',
       'log.action.fallback-lane': '备用泳道',
 
       'rollback.title': '回退方式',

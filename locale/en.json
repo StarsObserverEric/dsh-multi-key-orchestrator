@@ -140,6 +140,7 @@
     "quota.cny": "¥{amount} balance",
     "quota.deepseekUnsupported": "This provider does not expose a balance that can be read from here.",
     "common.unknownError": "Unknown error",
-    "common.httpStatus": "HTTP {code}"
+    "common.httpStatus": "HTTP {code}",
+    "log.action.fail": "failed"
   }
 }
