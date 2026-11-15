@@ -200,7 +200,7 @@ dsh plugin --profile desktop remove @stars_observer_eric/dsh-multi-key-orchestra
 
 **配置放哪儿。** 开关、上限、Key 清单、备注存在插件自己的状态文件里（插件目录下 `.state/state.json`，权限 0600），不写你的 profile 配置，也不改写 DSH 设置。凭据本体交给 DSH 的凭据服务，插件文件里只有引用名。
 
-**对外接口。** 四个本机路由（`status` / `config` / `probe` / `selftest`），只接受来自本机的请求：判定依据是 TCP 连接的对端地址（客户端改不了），`Host` / `Origin` 只作为第二道闸门；拿不到连接信息时一律拒绝，不做放行。
+**对外接口。** 四个本机路由（`status` / `config` / `probe` / `selftest`），每一层都要过闸：先由宿主会话判定（`ctx.connection.requestRejection`，即 Host/Origin 栅栏 + 浏览器认证），再要求 TCP 对端就是本机。拿不到连接或认证服务时一律拒绝，绝不默认放行。
 
 ---
 

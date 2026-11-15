@@ -37,6 +37,8 @@ function createHarness() {
   const credentialStore = new Map()
   /** sessionId -> SessionHeader, for the main/child lane decision. */
   const sessionHeaders = new Map()
+  /** The host-session gate the routes ask before touching keys. */
+  const connection = { available: true, rejection: undefined, allowsRemoteAuthorities: false }
 
   const credentials = {
     async set(ref, value) {
@@ -69,6 +71,15 @@ function createHarness() {
     },
     get(name) {
       if (name === 'credentials') return credentials
+      // The routes ask Connection whether this caller carries an authenticated
+      // host session before they touch a stored API key.
+      if (name === 'connection') {
+        if (!connection.available) return undefined
+        return {
+          requestRejection: () => connection.rejection,
+          allowsRemoteAuthorities: connection.allowsRemoteAuthorities,
+        }
+      }
       // The lane decision reads the session header, which is the only place the
       // parentage of a delegated session is recorded.
       if (name === 'sessions') {
@@ -173,6 +184,7 @@ function createHarness() {
     routes,
     credentialStore,
     sessions: sessionHeaders,
+    connection,
     listener,
     call,
     dispose() {
@@ -972,6 +984,53 @@ test('a route still accepts a loopback peer', async () => {
       })
       assert.equal(ok.code, 200, `${peer} should be admitted`)
     }
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a route refuses a caller the host session does not admit', async () => {
+  const harness = await boot()
+  try {
+    harness.connection.rejection = 403
+    const denied = await harness.call('status', 'GET')
+    assert.equal(denied.code, 403, 'a rejected host session must not read the panel state')
+
+    harness.connection.rejection = 401
+    const unauthenticated = await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    assert.equal(unauthenticated.code, 401)
+    assert.equal(unauthenticated.body.error, 'host-session-required')
+
+    harness.connection.rejection = undefined
+    const admitted = await harness.call('status', 'GET')
+    assert.equal(admitted.code, 200)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a route refuses every caller when the host session gate is missing', async () => {
+  const harness = await boot()
+  try {
+    harness.connection.available = false
+    // Fail closed: without Connection there is no way to authenticate the caller.
+    for (const suffix of ['status', 'config', 'probe', 'selftest']) {
+      const denied = await harness.call(suffix, suffix === 'status' ? 'GET' : 'POST', {})
+      assert.equal(denied.code, 401, suffix)
+    }
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a trusted remote authority does not need a loopback socket', async () => {
+  const harness = await boot()
+  try {
+    harness.connection.allowsRemoteAuthorities = true
+    const admitted = await harness.call('status', 'GET', undefined, {
+      socket: { remoteAddress: '203.0.113.9', remotePort: 41234 },
+    })
+    assert.equal(admitted.code, 200, 'the deployment already trusts that authority')
   } finally {
     harness.dispose()
   }

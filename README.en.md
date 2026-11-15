@@ -174,7 +174,7 @@ Leases first keeps concurrency even; the rotation cursor second keeps **sequenti
 
 **State.** The switch, caps, key list and notes live in the plugin's own state file (`.state/state.json` inside the plugin directory, mode 0600). Your profile configuration is never rewritten, and secrets go to DSH's credential service — the plugin's file only holds reference names.
 
-**Routes.** Four local routes (`status`, `config`, `probe`, `selftest`), reachable only from this machine. The decision is made on the TCP peer address, which the caller cannot forge; `Host` and `Origin` are a second gate. A request whose connection cannot be inspected is refused rather than let through.
+**Routes.** Four local routes (`status`, `config`, `probe`, `selftest`), each behind two gates: the host session decides first (`ctx.connection.requestRejection` — the Host/Origin fence plus browser authentication), then the TCP peer must be this machine. A missing connection, or a missing authentication service, is a refusal rather than a pass.
 
 ---
 

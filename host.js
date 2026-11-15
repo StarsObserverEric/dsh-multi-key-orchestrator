@@ -239,24 +239,6 @@ function readJsonBody(request) {
   })
 }
 
-/** Loopback hostnames a local plugin surface may be addressed by. */
-const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]'])
-
-/**
- * Strip the optional `:port` from a Host header value, IPv6-bracket aware.
- * @param {string} host
- */
-function hostnameOfHost(host) {
-  let hostname = host.trim().toLowerCase()
-  if (hostname.startsWith('[')) {
-    const end = hostname.indexOf(']')
-    return end === -1 ? hostname : hostname.slice(0, end + 1)
-  }
-  const colon = hostname.lastIndexOf(':')
-  if (colon !== -1 && /^\d+$/.test(hostname.slice(colon + 1))) hostname = hostname.slice(0, colon)
-  return hostname
-}
-
 /**
  * Every loopback form Node reports for a peer address: IPv4, IPv6, and the
  * IPv4-mapped IPv6 form a dual-stack listener produces.
@@ -264,34 +246,41 @@ function hostnameOfHost(host) {
 const LOOPBACK_PEERS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
 
 /**
- * Prove the caller is on this machine before it may touch stored API keys.
+ * Decide whether a request may touch stored API keys.
  *
- * The peer address decides, because it is the one part of the exchange the
- * caller cannot write: `Host` and `Origin` are request headers, so a remote
- * client can send `Host: 127.0.0.1` and pass a header-only check. The header
- * checks stay as a second gate — they are what keeps a DNS-rebinding page from
- * driving a loopback-hosted server — but they never decide alone.
+ * The host session decides first. `ctx.connection.requestRejection` applies
+ * Connection's own Host/Origin fence and browser authentication, so a route that
+ * reads and writes credentials can never answer an unauthenticated caller. When
+ * that service is unavailable the request is refused — never trusted by default.
  *
- * Failure is closed: a request whose socket exposes no peer address cannot be
- * shown to be local, so it is refused instead of let through.
+ * The socket peer is the second gate: unless this deployment explicitly trusts a
+ * remote authority, only this machine may drive the route, because every header
+ * a caller sends is a header a caller can forge.
+ *
+ * @param {any} ctx the plugin context, read for the `connection` service
  * @param {import('node:http').IncomingMessage} request
+ * @returns {401 | 403 | undefined} the status to answer with, or undefined to admit
  */
-function loopbackRequest(request) {
+function trustRejection(ctx, request) {
+  const connection = (() => {
+    try {
+      return ctx.get('connection')
+    } catch {
+      return undefined
+    }
+  })()
+  if (!connection || typeof connection.requestRejection !== 'function') return 401
+  let rejected
+  try {
+    rejected = connection.requestRejection(request)
+  } catch {
+    return 401
+  }
+  if (rejected !== undefined) return rejected === 401 ? 401 : 403
+  if (connection.allowsRemoteAuthorities === true) return undefined
   const socket = request?.socket ?? request?.connection
   const remote = typeof socket?.remoteAddress === 'string' ? socket.remoteAddress.trim().toLowerCase() : ''
-  if (remote.length === 0) return false
-  if (!LOOPBACK_PEERS.has(remote)) return false
-  const host = request.headers?.host
-  if (typeof host !== 'string' || host.trim().length === 0) return false
-  if (!LOOPBACK_HOSTS.has(hostnameOfHost(host))) return false
-  const origin = request.headers?.origin
-  if (typeof origin !== 'string' || origin.trim().length === 0) return true
-  try {
-    const { hostname } = new URL(origin)
-    return LOOPBACK_HOSTS.has(hostname) || hostname === '::1'
-  } catch {
-    return false
-  }
+  return LOOPBACK_PEERS.has(remote) ? undefined : 403
 }
 
 /** @param {number} ms */
@@ -1506,7 +1495,7 @@ export function apply(ctx) {
   const buildStatus = async () => {
     const catalog = await buildCatalog()
     return {
-    version: '0.4.2',
+    version: '0.4.3',
     enabled: state.enabled === true,
     startedAt,
     savedAt: lastSavedAt || undefined,
@@ -1986,10 +1975,17 @@ export function apply(ctx) {
   ctx.effect(() => listen('llm-pi-ai/request-headers', headerListener))
   ctx.effect(() => listen('agent/request-error', requestErrorListener))
 
-  /** Refuse anything that is not a same-origin loopback request. */
+  /**
+   * Refuse anything the host session does not admit, and anything that is not
+   * this machine's traffic.
+   */
   const guarded = (handler) => async (request, response) => {
-    if (!loopbackRequest(request)) {
-      sendJson(response, 403, { ok: false, error: 'request-not-trusted' })
+    const rejection = trustRejection(ctx, request)
+    if (rejection !== undefined) {
+      sendJson(response, rejection, {
+        ok: false,
+        error: rejection === 401 ? 'host-session-required' : 'request-not-trusted',
+      })
       return
     }
     return handler(request, response)
