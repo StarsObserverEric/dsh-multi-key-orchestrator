@@ -786,8 +786,11 @@ export function apply(ctx) {
     let finish
     let thrown
     const scope = { keyId: lease.keyId, secret }
-    const iterable = als.run(scope, () => next())
     try {
+      // `next()` itself may throw synchronously (an adapter that validates and
+      // refuses before returning an iterable). It must be inside this try, or a
+      // synchronous 429 would escape exactly like an async one used to.
+      const iterable = als.run(scope, () => next())
       for await (const chunk of iterable) {
         if (!chunk || typeof chunk !== 'object') continue
         if (chunk.type === 'finish') {
@@ -1072,11 +1075,14 @@ export function apply(ctx) {
       stats.swaps += 1
       return next()
     } catch (error) {
-      // A thrown header listener fails the call with REQUEST_HEADERS; keep the
-      // message secret-free and degrade to the native header instead.
+      // A thrown header listener fails the call with REQUEST_HEADERS. Leave the
+      // native header alone unless a swap actually happened: writing
+      // `Bearer ` with no secret would turn a working request into a 401.
       logLine(`header swap failed: ${String(error?.message ?? error)}`)
-      const hasAuthorization = headers.has('authorization')
-      if (hasAuthorization) headers.set('authorization', `Bearer ${selection?.secret ?? ''}`)
+      if (selection?.secret) {
+        if (headers.has('x-api-key')) headers.set('x-api-key', selection.secret)
+        if (headers.has('authorization')) headers.set('authorization', `Bearer ${selection.secret}`)
+      }
       return next()
     }
   }
@@ -1495,7 +1501,7 @@ export function apply(ctx) {
   const buildStatus = async () => {
     const catalog = await buildCatalog()
     return {
-    version: '0.4.3',
+    version: '0.4.4',
     enabled: state.enabled === true,
     startedAt,
     savedAt: lastSavedAt || undefined,
@@ -1675,7 +1681,12 @@ export function apply(ctx) {
         poolState.keyCaps = poolState.keyCaps ?? {}
         const keyId = String(body?.keyId ?? '')
         if (!providerKeysOf(provider).some((key) => key.id === keyId)) throw new Error(`unknown key ${keyId}`)
-        const cap = clamp(Number(body?.maxConcurrent ?? 0), 0, 128)
+        // A missing field used to be read as 0, which silently deleted the cap —
+        // a client typo wiped the configuration. Only an explicit value changes it.
+        if (!Number.isFinite(Number(body?.maxConcurrent))) {
+          throw new Error('maxConcurrent is required (send 0 to clear the per-key cap)')
+        }
+        const cap = clamp(Number(body.maxConcurrent), 0, 128)
         if (cap > 0) poolState.keyCaps[keyId] = cap
         else delete poolState.keyCaps[keyId]
         rebuildPools()
@@ -1953,10 +1964,12 @@ export function apply(ctx) {
         rebuildPools()
         persist()
       }
+      // Inside the try: a throw here would reject the interval's promise, and an
+      // unhandled rejection takes the whole Host process down with it.
+      maintenance()
     } catch (error) {
       logLine(`housekeeping failed: ${String(error?.message ?? error)}`)
     }
-    maintenance()
   }
 
   // -------------------------------------------------------------------- wiring
@@ -2005,7 +2018,11 @@ export function apply(ctx) {
   )
 
   ctx.effect(() => {
-    const timer = setInterval(housekeeping, 30_000)
+    // A rejected housekeeping pass must never become an unhandled rejection:
+    // Node treats that as fatal, and this timer runs for the whole session.
+    const timer = setInterval(() => {
+      housekeeping().catch((error) => logLine(`housekeeping crashed: ${String(error?.message ?? error)}`))
+    }, 30_000)
     if (timer && typeof timer.unref === 'function') timer.unref()
     return () => {
       clearInterval(timer)

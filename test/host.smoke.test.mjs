@@ -171,8 +171,13 @@ function createHarness() {
         },
       }
       setImmediate(() => {
-        if (body !== undefined) {
-          for (const handler of handlers.data ?? []) handler(Buffer.from(JSON.stringify(body)))
+        const payload = request.__rawBody !== undefined
+          ? Buffer.from(request.__rawBody)
+          : body !== undefined
+            ? Buffer.from(JSON.stringify(body))
+            : undefined
+        if (payload !== undefined) {
+          for (const handler of handlers.data ?? []) handler(payload)
         }
         for (const handler of handlers.end ?? []) handler()
       })
@@ -1031,6 +1036,154 @@ test('a trusted remote authority does not need a loopback socket', async () => {
       socket: { remoteAddress: '203.0.113.9', remotePort: 41234 },
     })
     assert.equal(admitted.code, 200, 'the deployment already trusts that authority')
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('an adapter that throws synchronously is cooled and rotated too', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    let calls = 0
+    const next = () => {
+      calls += 1
+      if (calls === 1) {
+        // Refuses before returning any iterable: the synchronous twin of the
+        // async throw covered above.
+        throw Object.assign(new Error('429 concurrency_exceeded'), { status: 429 })
+      }
+      return stream(SUCCESS)()
+    }
+    const chunks = await collect(streamListener(OPTIONS, next))
+    assert.equal(calls, 2, 'the synchronous failure was retried on another key')
+    assert.deepEqual(chunks, SUCCESS)
+    const status = await harness.call('status', 'GET')
+    assert.equal(status.body.status.log.filter((entry) => entry.action === 'cooldown').length, 1)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a consumer that stops early gives its lease back', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    const iterator = streamListener(OPTIONS, stream(SUCCESS))[Symbol.asyncIterator]()
+    await iterator.next()
+    const mid = await harness.call('status', 'GET')
+    const leasedMid = mid.body.status.pools[0].lane.total
+    assert.equal(leasedMid, 1, 'the lease is held while the stream is live')
+    await iterator.return(undefined)
+    const after = await harness.call('status', 'GET')
+    assert.equal(after.body.status.pools[0].lane.total, 0, 'closing the stream returned the lease')
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a next() that returns no iterable fails cleanly and keeps no lease', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    await assert.rejects(async () => collect(streamListener(OPTIONS, () => undefined)))
+    const status = await harness.call('status', 'GET')
+    assert.equal(status.body.status.pools[0].lane.total, 0, 'no lease leaked')
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('set-key-cap refuses a request without an explicit maxConcurrent', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    const keys = (await harness.call('status', 'GET')).body.status.pools[0].keys
+    const target = keys[0].id
+    const set = await harness.call('config', 'POST', {
+      op: 'set-key-cap', provider: 'ecnu', model: 'ecnu-max', keyId: target, maxConcurrent: 2,
+    })
+    assert.equal(set.body.ok, true)
+    const cleared = await harness.call('config', 'POST', {
+      op: 'set-key-cap', provider: 'ecnu', model: 'ecnu-max', keyId: target,
+    })
+    assert.equal(cleared.body.ok, false, 'a typo must not delete the cap')
+    const after = (await harness.call('status', 'GET')).body.status.pools[0].keys.find((key) => key.id === target)
+    assert.equal(after.maxConcurrent, 2, 'the cap survived the malformed request')
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('an oversized body is refused', async () => {
+  const harness = await boot()
+  try {
+    const huge = { op: 'toggle', pad: 'x'.repeat(1_100_000) }
+    const response = await harness.call('config', 'POST', huge)
+    assert.equal(response.body.ok, false)
+    assert.equal(response.code, 400)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('malformed JSON is refused with 400', async () => {
+  const harness = await boot()
+  try {
+    const response = await harness.call('config', 'POST', undefined, { __rawBody: '{not json' })
+    assert.equal(response.code, 400)
+    assert.equal(response.body.ok, false)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a corrupt state file does not stop the plugin from booting', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'multi-key-corrupt-'))
+  fs.writeFileSync(path.join(dir, 'state.json'), '{ this is not json', 'utf8')
+  const harness = await boot({ stateDir: dir })
+  try {
+    const status = await harness.call('status', 'GET')
+    assert.equal(status.code, 200)
+    assert.equal(status.body.ok, true)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('a state file with the wrong shapes does not stop the plugin from booting', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'multi-key-wrongshape-'))
+  fs.writeFileSync(
+    path.join(dir, 'state.json'),
+    JSON.stringify({ version: 2, pools: 'not-an-array', providers: 7, limits: 'nope', quota: [] }),
+    'utf8',
+  )
+  const harness = await boot({ stateDir: dir })
+  try {
+    const status = await harness.call('status', 'GET')
+    assert.equal(status.code, 200)
+    assert.equal(status.body.ok, true)
+    const added = await harness.call('config', 'POST', {
+      op: 'add-provider-key', provider: 'ecnu', note: 'after corruption', value: 'sk-fresh-000000000000',
+    })
+    assert.equal(added.body.ok, true, 'the panel can still write after recovering')
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('an unknown config op is refused rather than silently accepted', async () => {
+  const harness = await boot()
+  try {
+    const response = await harness.call('config', 'POST', { op: 'make-me-a-sandwich' })
+    assert.equal(response.body.ok, false)
+    assert.match(String(response.body.error), /unknown|unsupported|op/i)
   } finally {
     harness.dispose()
   }
