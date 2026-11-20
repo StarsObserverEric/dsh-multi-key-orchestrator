@@ -99,6 +99,7 @@ The navigation icon column on the left, one row **below Context Insights**, name
 | Control | Meaning |
 |---|---|
 | Master switch | off = the plugin steps aside entirely and every request uses DSH's native single-key path; your configuration is kept |
+| Overlay | Whether the live request window is shown in the bottom-right corner. On by default; hiding it keeps every setting |
 | Expand all / Collapse all | open or close every provider at once |
 | Refresh all balances | query every key's balance right now (otherwise refreshed in the background) |
 | Pending bar | appears when you have unsaved edits: `N pending changes` with **Apply** / **Discard** |
@@ -116,6 +117,7 @@ Providers are collapsed by default; click the header to open one. Top to bottom:
 - Each row shows: the mask (always dots), where the key came from, the provider-side account id (an identifier, never the secret), state (healthy / cooling / exhausted / disabled), failure count, last success, an editable **note**, and an **enabled** checkbox.
 - The key **adopted from your settings** is marked `from Settings` and always sits first. It cannot be removed or hidden — it is your own credential, and the plugin only borrows it.
 - Only keys you added here have **Remove key**, which also deletes the credential the plugin stored for it.
+- Every key has a **Test connection** button: one character in, one token out, and any output at all counts as connected. The result appears under the row (`connected in 123 ms` / `failed: reason`). The probe **holds a real concurrency slot** (waiting up to 8 s, then reporting "busy" without sending), so it can never push a key into a 429 and never steals the slot reserved for the main conversation.
 - The **balance card** on the right shows remaining / limit, a bar, quota state, when it was last checked, when it will be checked next, the reset time to the second, and a manual refresh. If the provider exposes no quota endpoint, the card says why instead of inventing a number.
 - The last row adds a key: a note plus a write-only password field that clears on submit; afterwards the key is only ever shown as dots.
 
@@ -125,13 +127,60 @@ Providers are collapsed by default; click the header to open one. Top to bottom:
 - **Link total to per-API caps** — when checked, `total` greys out and equals the sum of the per-key caps, with the arithmetic printed underneath (`total = 3 + 3 + 2 = 8`). Uncheck it and `total` becomes editable.
 - **Reserved for main** — how many of this model's slots are kept for the main conversation.
 - **Lend the reserved slot…** — whether that reserve may be lent to subagents while the main conversation is idle.
-- **Per-API caps** — one column per key: that key's own limit for this model. Empty means no extra limit for that column.
+- **Per-API caps** — one column per key: that key's own limit for this model. Empty or `0` means the default of 3.
 - The line under the grid is live: main leases, subagent leases, capacity, and how many requests are waiting.
+
+### Live overlay (floating window)
+
+The small window in the bottom-right corner shows **every request in flight right now**, including requests from other conversations and from subagents:
+
+- The top bar is the title row: a chevron, the name, and an `N in flight` counter. Click it to expand or collapse. The panel grows **down and to the right** with the top-left corner pinned, so the bar never moves out from under the pointer.
+- **Drag the top bar** to move the window, like a Windows title bar. The position is remembered. When the app window is resized, maximised or restored, the overlay is pushed back inside the visible area instead of ending up off-screen.
+- One row per request: **conversation › subagent**, main/sub, model, the key it went out on (your note), and how long it has been running. Sorted by model, then by key.
+- The middle block summarises: one line per busy model (`in flight / total`), then every key of that model with `active / cap`; keys that are out of credit are marked ⛔ and excluded from the total.
+- No backdrop blur is added: glass is the job of a Wallpaper Engine style plugin that styles the whole window frame, and two layers of blur fight each other.
+
+Example:
+
+```
+─────────────────────────────────────────────
+Live requests                       2 in flight
+─────────────────────────────────────────────
+ecnu-max 2/9
+ZSQ:1/3   LB:1/3   default:0/3⛔
+─────────────────────────────────────────────
+telegram-with-auto-replier › collect   main  ecnu-max  ZSQ   12s
+this conversation                       sub  ecnu-max  LB     3s
+```
 
 ### Bottom of the page
 
 - **Diagnostics** — how requests are correlated with sessions, a recent-activity log (every acquire, release and cooldown), and a self-test that exercises the caps and the queue with simulated traffic without sending a single real request.
 - **Rolling back** — three ways to stop: flip the switch, disable the plugin on the Plugins page, or uninstall. The native request path was never modified, so nothing else needs undoing.
+
+---
+
+### 4. An exhausted key steps aside — and comes back on its own
+
+- After any failed request the plugin re-reads that key's balance (at most once per 10 s per key) instead of trusting the wording of the error: providers answer in English, in Chinese, with a code, or with nothing at all.
+- Balance at zero → the key leaves the rotation immediately and **its slots are subtracted from the pool total** (three keys of 3 → 9, one spent → 6). The surplus requests queue behind the healthy keys instead of hammering the dead one.
+- A parked key is re-checked every 60–180 s and rejoins the rotation by itself once its balance is back; the total follows it up again.
+- The panel shows the state ("balance spent") and the floating window marks it with ⛔.
+
+The boundary: this is a *balance* decision, not a *rate-limit* decision. A provider-side 168-hour window that the balance endpoint cannot see is still handled by 429 classification plus a cooldown.
+
+### 5. The same key pasted twice counts once
+
+A key taken from Settings and the same key pasted in the panel are one account as far as the provider is concerned, so they are merged into one scheduling unit by secret fingerprint. Three entries never advertise nine slots (which would guarantee 429s). After merging, the meaningful note wins (`default` + `LB` → `LB`), so the panel never shows two "default" rows.
+
+### 6. Re-issuing the Settings key is noticed immediately
+
+When the key in Settings is replaced, the plugin re-reads the credential, drops that key's cached balance and its parked state, and rebuilds the pools — the panel shows the new account, not the ghost of the old one.
+
+### 7. A key without its own cap is not "unlimited"
+
+A key with no per-key cap now contributes, and is limited to, the default **3**. It used to mean "no limit", which let a single key eat the whole pool — one of the roots of "three keys configured, still 429".
+
 
 ---
 

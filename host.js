@@ -20,7 +20,9 @@
  * @module dsh-multi-key-orchestrator
  */
 
+import fs from 'node:fs'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { AsyncLocalStorage } from 'node:async_hooks'
 
@@ -74,8 +76,12 @@ function defaultState() {
     enabled: false,
     midStreamRetry: true,
     midStreamMaxRetries: 2,
+    /* Off by default: the operator's per-key caps stay authoritative. */
+    enforceReportedCeiling: false,
     /** Lane used when subagent detection is impossible: conservative by default. */
     laneFallback: 'child',
+    /** Client preferences that survive a reload and apply to every window. */
+    ui: { showLive: true },
     pools: [],
     /** Provider-wide caps: `{ [provider]: { maxConcurrent } }`, 0 = unlimited. */
     providers: {},
@@ -89,7 +95,9 @@ function defaultState() {
     quota: {
       mode: 'active',
       ttlMs: 60_000,
-      recheckExhaustedMs: [1_800_000, 3_600_000],
+      // A parked key is re-checked within a minute: recovery must not wait half
+      // an hour while the other keys idle.
+      recheckExhaustedMs: [60_000, 180_000],
       timeoutMs: 5_000,
     },
     classify: { quotaPatterns: undefined, transientPatterns: undefined },
@@ -99,10 +107,26 @@ function defaultState() {
   }
 }
 
+/**
+ * The half-hour exhausted-key recheck was an older default. An install that
+ * still carries it keeps a key parked for up to an hour after its balance came
+ * back, which reads as "the plugin ignored the recovery". Only that exact pair
+ * is migrated; any other value is the operator's own choice.
+ */
+const LEGACY_EXHAUSTED_RECHECK = [1_800_000, 3_600_000]
+
 /** @param {any} loaded @returns {any} */
 function mergeState(loaded) {
   const base = defaultState()
   if (!loaded || typeof loaded !== 'object') return base
+  const quota = { ...base.quota, ...(loaded.quota ?? {}) }
+  if (
+    Array.isArray(quota.recheckExhaustedMs) &&
+    quota.recheckExhaustedMs.length === LEGACY_EXHAUSTED_RECHECK.length &&
+    quota.recheckExhaustedMs.every((value, index) => Number(value) === LEGACY_EXHAUSTED_RECHECK[index])
+  ) {
+    quota.recheckExhaustedMs = base.quota.recheckExhaustedMs.slice()
+  }
   return {
     ...base,
     ...loaded,
@@ -110,9 +134,10 @@ function mergeState(loaded) {
     // the bytes on disk still say v1.
     version: 2,
     limits: { ...base.limits, ...(loaded.limits ?? {}) },
-    quota: { ...base.quota, ...(loaded.quota ?? {}) },
+    quota,
     classify: { ...base.classify, ...(loaded.classify ?? {}) },
     debug: { ...base.debug, ...(loaded.debug ?? {}) },
+    ui: { ...base.ui, ...(loaded.ui ?? {}) },
     secretsFallback: { ...(loaded.secretsFallback ?? {}) },
     providers: migrateProviders(loaded),
     pools: migratePools(loaded),
@@ -344,6 +369,174 @@ export function apply(ctx) {
     logRing.push({ t: Date.now(), ...entry })
   }
 
+  // ------------------------------------------------------------- live monitor
+
+  /**
+   * Every request currently in flight, keyed by a row id that survives the
+   * whole attempt loop. This is what the floating window shows: one row per
+   * request of every conversation and every subagent, never a summary.
+   * @type {Map<number, any>}
+   */
+  const liveRows = new Map()
+  const liveDone = []
+  const liveSeen = { total: 0, leased: 0, passthrough: 0, byKey: Object.create(null) }
+  let liveRowSeq = 0
+  let liveWrittenAt = 0
+
+  /** Name of the conversation a session hangs off, walked to its root. */
+  const sessionTitleCache = new Map()
+
+  /**
+   * The sidebar title of a session's root conversation.
+   * `sessionTitle.get(session)` is the same string the sidebar prints, which is
+   * the only name the operator recognises.
+   * @param {string | undefined} sessionId
+   */
+  function sessionTitleOf(sessionId) {
+    if (!sessionId) return ''
+    const cached = sessionTitleCache.get(sessionId)
+    if (cached && Date.now() - cached.at < 30_000) return cached.title
+    let title = ''
+    try {
+      const sessions = ctx.get('sessions')
+      const service = ctx.get('sessionTitle')
+      const session = typeof sessions?.get === 'function' ? sessions.get(sessionId) : undefined
+      if (service && session && typeof service.get === 'function') {
+        const got = service.get(session)
+        title = String(got?.title ?? '')
+      }
+    } catch {
+      /* a title is decoration, never a reason to fail a request */
+    }
+    sessionTitleCache.set(sessionId, { title, at: Date.now() })
+    return title
+  }
+
+  /** The root conversation of a session (itself when it is not a subagent). */
+  function rootSessionOf(sessionId) {
+    let current = sessionId
+    for (let depth = 0; depth < 8 && current; depth += 1) {
+      let parent
+      try {
+        const sessions = ctx.get('sessions')
+        parent = typeof sessions?.get === 'function' ? sessions.get(current)?.header?.parentSession : undefined
+      } catch {
+        parent = undefined
+      }
+      if (!parent) return current
+      current = parent
+    }
+    return current ?? sessionId
+  }
+
+  /** session id -> the panel label the operator gave that subagent. */
+  const nameBySession = new Map()
+  let descendantNamesAt = 0
+  /** The catalog read currently in flight, shared by every request. */
+  let descendantRefresh = null
+
+  /**
+   * The `label` of a subagent — the top line of the subagents panel, which is
+   * the readable name ("Finish conversation pane wiring"), not its slug.
+   *
+   * `listDescendants` is asynchronous and a main request fires it without
+   * waiting, so a subagent request that arrives a moment later must join the
+   * read that is already running instead of being throttled to an empty cache.
+   * @param {string | undefined} rootId
+   * @param {{ force?: boolean }} [options]
+   */
+  async function refreshSubagentNames(rootId, options = {}) {
+    if (!rootId) return
+    if (descendantRefresh) return descendantRefresh
+    if (options.force !== true && Date.now() - descendantNamesAt < 5_000) return
+    descendantRefresh = (async () => {
+      try {
+        const subagents = ctx.get('subagents')
+        if (typeof subagents?.listDescendants !== 'function') {
+          record({ action: 'names', detail: 'subagents service unavailable' })
+          return
+        }
+        const entries = await subagents.listDescendants(rootId)
+        const list = Array.isArray(entries) ? entries : []
+        let named = 0
+        for (const entry of list) {
+          if (!entry || entry.kind === 'diagnostic') continue
+          const id = entry.id ?? entry.sessionId
+          if (!id) continue
+          const label = String(entry.label ?? entry.name ?? '')
+          if (label === '') continue
+          nameBySession.set(String(id), { label, at: Date.now() })
+          named += 1
+        }
+      } catch (error) {
+        record({
+          action: 'names',
+          detail: 'subagent names unavailable: ' + String(error?.message ?? error).slice(0, 120),
+        })
+      } finally {
+        descendantNamesAt = Date.now()
+        descendantRefresh = null
+      }
+    })()
+    return descendantRefresh
+  }
+
+  function agentLabelOf(sessionId) {
+    if (!sessionId) return ''
+    const known = nameBySession.get(sessionId)
+    if (known && Date.now() - known.at < 60_000) return known.label
+    return ''
+  }
+
+  /**
+   * Persist what is in flight, throttled to one write per second.
+   *
+   * The panel route is behind the browser trust fence, so an external script
+   * (or a person debugging) reads this file instead of the HTTP API. It carries
+   * no secret: only key ids, notes and counters.
+   */
+  const writeLiveFile = () => {
+    const now = Date.now()
+    if (now - liveWrittenAt < 1_000) return
+    liveWrittenAt = now
+    try {
+      const payload = {
+        at: new Date(now).toISOString(),
+        seen: {
+          total: liveSeen.total,
+          leased: liveSeen.leased,
+          passthrough: liveSeen.passthrough,
+          byKey: { ...liveSeen.byKey },
+        },
+        active: [...liveRows.values()].sort((a, b) => a.at - b.at),
+        recent: liveDone.slice(-20).reverse(),
+        log: logRing.list().slice(-14),
+        pools: poolStates().map((poolState) => {
+          const snapshot = pools.get(poolIdentity(poolState.provider, poolState.model))?.orchestrator.snapshot()
+          return {
+            pool: `${poolState.provider}/${poolState.model}`,
+            maxConcurrent: poolState.maxConcurrent,
+            admitTotal: snapshot?.admitTotal ?? poolState.maxConcurrent,
+            lane: snapshot?.lane ?? {},
+            keys: (snapshot?.keys ?? []).map((key) => ({
+              id: key.id,
+              active: key.activeLeases,
+              cap: key.maxConcurrent,
+              cooldown: key.state === 'cooldown',
+              parked: key.state === 'quota_exhausted',
+            })),
+          }
+        }),
+      }
+      fs.writeFileSync(path.join(path.dirname(store.path), 'live.json'), JSON.stringify(payload, null, 2), {
+        encoding: 'utf8',
+        mode: 0o600,
+      })
+    } catch {
+      /* a debug mirror that cannot be written must never break routing */
+    }
+  }
+
   const credentialsService = () => {
     try {
       return ctx.get('credentials')
@@ -493,17 +686,16 @@ export function apply(ctx) {
       backoffWindowsMs: state.limits.backoffWindowsMs,
     },
     classify: state.classify,
-    // A model's keys are the provider's keys, each carrying this model's own cap.
-    keys: providerKeysOf(poolState.provider)
-      .filter((key) => key.enabled !== false)
-      .map((key) => ({
-        id: key.id,
-        ref: key.ref,
-        note: key.note,
-        maskedLabel: key.maskedLabel,
-        enabled: true,
-        maxConcurrent: Math.max(0, Number(poolState.keyCaps?.[key.id] ?? 0)),
-      })),
+    // A model's keys are the provider's *distinct* credentials, each carrying
+    // this model's own cap. Two entries holding the same secret are one key.
+    keys: schedulingKeysOf(poolState.provider).map((key) => ({
+      id: key.id,
+      ref: key.ref,
+      note: key.note,
+      maskedLabel: key.maskedLabel,
+      enabled: true,
+      maxConcurrent: capOfSchedulingKey(poolState, key),
+    })),
   })
 
   /**
@@ -589,6 +781,121 @@ export function apply(ctx) {
   const poolStateOf = (provider, model) =>
     state.pools.find((pool) => pool.provider === provider && pool.model === model)
 
+  // ------------------------------------------------------- credential identity
+
+  /**
+   * sha256 of every configured secret, keyed by its credential ref.
+   *
+   * Two entries can hold the *same* physical credential (the operator pastes the
+   * same key twice, or a ref is re-issued in place). The provider counts those as
+   * one account, so the pool must count them as one scheduling unit as well —
+   * otherwise three entries of two real keys advertise 9 slots against a real
+   * ceiling of 6, and the overflow lands as a 429 on every key.
+   * @type {Map<string, string>}
+   */
+  const credentialFingerprints = new Map()
+  let fingerprintsCollectedAt = 0
+
+  /**
+   * Re-read every credential.
+   *
+   * The Settings key can be re-issued in place, and a cached fingerprint would
+   * keep the old identity — and the old balance card — attached to a credential
+   * that no longer exists. Always resolving is what lets a rotated key be
+   * noticed at all.
+   * @returns {Promise<{ learned: boolean, rotated: string[] }>}
+   */
+  async function collectCredentialFingerprints() {
+    let learned = false
+    const rotated = []
+    for (const provider of Object.keys(state.providers ?? {})) {
+      const keys = Array.isArray(state.providers?.[provider]?.keys) ? state.providers[provider].keys : []
+      for (const key of keys) {
+        if (typeof key?.ref !== 'string' || key.ref.length === 0) continue
+        const secret = await getSecret(key.ref).catch(() => undefined)
+        if (typeof secret !== 'string' || secret.length === 0) continue
+        const fingerprint = createHash('sha256').update(secret).digest('hex').slice(0, 32)
+        const previous = credentialFingerprints.get(key.ref)
+        if (previous === fingerprint) continue
+        credentialFingerprints.set(key.ref, fingerprint)
+        if (previous === undefined) learned = true
+        else rotated.push(key.id)
+      }
+    }
+    fingerprintsCollectedAt = Date.now()
+    return { learned, rotated }
+  }
+
+  /**
+   * Refresh the credential graph and react to a secret that changed under us: a
+   * rotated key starts from a clean slate (no stale balance, no stale park).
+   */
+  async function refreshCredentialGraph() {
+    const { learned, rotated } = await collectCredentialFingerprints()
+    for (const keyId of rotated) {
+      quota.invalidate(keyId)
+      for (const poolState of poolStates()) {
+        pools.get(poolIdentity(poolState.provider, poolState.model))?.orchestrator?.clearQuota(keyId, 'credential-rotated')
+      }
+      record({ action: 'quota', key: keyId, detail: 'credential changed; balance cache dropped' })
+    }
+    if (learned || rotated.length > 0) {
+      rebuildPools()
+      persist()
+    }
+    return learned
+  }
+
+  /**
+   * The scheduling units of a provider: one per distinct secret.
+   * @param {string} provider
+   */
+  const schedulingKeysOf = (provider) => {
+    const groups = new Map()
+    const out = []
+    for (const key of enabledProviderKeys(provider)) {
+      const fingerprint = credentialFingerprints.get(key.ref) ?? `ref:${key.ref ?? key.id}`
+      const existing = groups.get(fingerprint)
+      if (existing) {
+        existing.aliasIds.push(key.id)
+        existing.aliases.push(String(key.note ?? key.id))
+        // The generic placeholder name must never hide a real one: an entry that
+        // is "default" plus "LB" is the same credential the operator called LB.
+        const descriptive = [existing.note, key.note].filter((name) => name && name !== 'default')
+        if (descriptive.length > 0) existing.note = [...new Set(descriptive)].join(' / ')
+        continue
+      }
+      const unit = {
+        id: key.id,
+        ref: key.ref,
+        note: String(key.note ?? key.id),
+        maskedLabel: key.maskedLabel,
+        aliasIds: [key.id],
+        aliases: [String(key.note ?? key.id)],
+      }
+      groups.set(fingerprint, unit)
+      out.push(unit)
+    }
+    return out
+  }
+
+  /** The cap a key actually gets: its setting, or the documented default. */
+  const effectiveKeyCap = (poolState, keyId) => {
+    const configured = Math.max(0, Number(poolState?.keyCaps?.[keyId] ?? 0))
+    return configured > 0 ? configured : DEFAULT_PER_KEY_CONCURRENCY
+  }
+
+  /**
+   * The cap one scheduling unit gets: the largest cap among its aliases (they
+   * are the same credential, so they cannot be added together).
+   * @param {any} poolState
+   * @param {any} key
+   */
+  const capOfSchedulingKey = (poolState, key) => {
+    const ids = Array.isArray(key.aliasIds) && key.aliasIds.length > 0 ? key.aliasIds : [key.id]
+    return Math.max(1, ...ids.map((id) => effectiveKeyCap(poolState, id)))
+  }
+
   /**
    * When a pool is linked, its total is the sum of the per-key caps rather than
    * a number the user typed. Keeping the sum authoritative here means the panel,
@@ -597,11 +904,31 @@ export function apply(ctx) {
    */
   const recomputeLinkedTotal = (poolState) => {
     if (!poolState || poolState.linked === false) return
-    const keys = enabledProviderKeys(poolState.provider)
-    const sum = keys.reduce((total, key) => total + Math.max(0, Number(poolState.keyCaps?.[key.id] ?? 0)), 0)
-    // No per-key cap anywhere means "unlimited per key", so fall back to the
-    // historical 3-per-key budget instead of collapsing the pool to zero.
-    poolState.maxConcurrent = sum > 0 ? clamp(sum, 1, 128) : DEFAULT_PER_KEY_CONCURRENCY * Math.max(1, keys.length)
+    const keys = schedulingKeysOf(poolState.provider)
+    const sum = keys.reduce((total, key) => total + capOfSchedulingKey(poolState, key), 0)
+    // Every scheduling unit contributes at least the default cap, so a provider
+    // with n distinct keys is n x 3 unless the operator says otherwise.
+    poolState.maxConcurrent = clamp(sum, 1, 128)
+  }
+
+  /**
+   * Give every pool's engine the current view of what can serve.
+   *
+   * A quota change is the one event that changes how many requests a pool may
+   * hold: a parked key's slots leave immediately, and a revived key's slots come
+   * back. Recomputing here keeps the number the panel shows and the number the
+   * engine enforces identical.
+   * @param {string} identity
+   */
+  const onPoolEvent = (identity, event) => {
+    record(event)
+    if (event.action === 'quota') {
+      const poolState = poolStates().find(
+        (candidate) => poolIdentity(candidate.provider, candidate.model) === identity,
+      )
+      if (poolState) queueMicrotask(() => refreshPoolAdmission(poolState))
+    }
+    writeLiveFile()
   }
 
   const rebuildPools = () => {
@@ -627,12 +954,13 @@ export function apply(ctx) {
         pools.set(identity, {
           key: identity,
           orchestrator: new PoolOrchestrator(config, {
-            onEvent: (event) => record(event),
+            onEvent: (event) => onPoolEvent(identity, event),
             providerGate,
           }),
         })
       }
     }
+    for (const poolState of poolStates()) refreshPoolAdmission(poolState)
   }
 
   /**
@@ -663,7 +991,41 @@ export function apply(ctx) {
 
   /** @param {any} poolState */
   const poolKeyDefs = (poolState) =>
-    enabledProviderKeys(poolState.provider).map((key) => keyDefFor(poolState.provider, key))
+    schedulingKeysOf(poolState.provider).map((key) => keyDefFor(poolState.provider, key))
+
+  /** Ids the engine has parked because their balance is gone. */
+  const parkedKeyIds = (poolState) => {
+    const parked = new Set()
+    const orchestrator = pools.get(poolIdentity(poolState.provider, poolState.model))?.orchestrator
+    if (!orchestrator) return parked
+    for (const key of orchestrator.keys.values()) if (key.quotaExhausted) parked.add(key.id)
+    return parked
+  }
+
+  /**
+   * Make the engine's total match the caps of the keys that can actually serve.
+   *
+   * Called whenever a key is parked or revived: a parked key's slots leave the
+   * pool immediately (so requests queue instead of hammering it), and come back
+   * the moment its balance does.
+   * @param {any} poolState
+   */
+  const refreshPoolAdmission = (poolState) => {
+    if (!poolState) return
+    // A linked pool owns no number of its own: its total *is* the sum of the
+    // caps, so it must follow what can serve. An unlinked pool carries a total
+    // the operator typed, and no automatic pass may overwrite it.
+    if (poolState.linked === false) return
+    const orchestrator = pools.get(poolIdentity(poolState.provider, poolState.model))?.orchestrator
+    if (!orchestrator) return
+    const parked = parkedKeyIds(poolState)
+    const usable = schedulingKeysOf(poolState.provider).filter(
+      (key) => !quota.isExhausted(key.id) && !parked.has(key.id),
+    )
+    const total = usable.reduce((sum, key) => sum + capOfSchedulingKey(poolState, key), 0)
+    orchestrator.setMaxConcurrent(Math.max(1, total))
+    writeLiveFile()
+  }
 
   /**
    * Evaluate the quota gate for one pool.
@@ -683,8 +1045,9 @@ export function apply(ctx) {
         ),
       )
     }
-    const isEligible = (keyRuntime) => !quota.isExhausted(keyRuntime.id)
-    const eligible = definitions.filter((definition) => !quota.isExhausted(definition.id))
+    const parked = parkedKeyIds(poolState)
+    const isEligible = (keyRuntime) => !quota.isExhausted(keyRuntime.id) && !parked.has(keyRuntime.id)
+    const eligible = definitions.filter((definition) => !quota.isExhausted(definition.id) && !parked.has(definition.id))
     return {
       isEligible,
       eligibleCount: eligible.length,
@@ -695,7 +1058,8 @@ export function apply(ctx) {
   /** @param {any} poolState */
   function gateSync(poolState) {
     const definitions = poolKeyDefs(poolState)
-    const eligible = definitions.filter((definition) => !quota.isExhausted(definition.id))
+    const parked = parkedKeyIds(poolState)
+    const eligible = definitions.filter((definition) => !quota.isExhausted(definition.id) && !parked.has(definition.id))
     return { eligibleCount: eligible.length, eligibleIds: eligible.map((definition) => definition.id) }
   }
 
@@ -846,6 +1210,50 @@ export function apply(ctx) {
     return { kind: 'success', contentStarted, emittedChars }
   }
 
+  /** Last time a key's balance was re-checked in response to a failure. */
+  const quotaRecheckAt = new Map()
+
+  /**
+   * Re-check one key's balance because a request through it just failed.
+   *
+   * The provider's wording is not something this plugin gets to rely on: a 429
+   * body can be English, Chinese, a code, or nothing at all. Asking the billing
+   * endpoint turns *any* failure into the one fact that matters — is this key
+   * still able to serve — and parks it on the spot when the answer is no.
+   *
+   * Throttled per key, so a burst of failures cannot become a burst of probes.
+   * @param {any} poolState
+   * @param {string} keyId
+   */
+  async function probeAfterFailure(poolState, keyId) {
+    const last = quotaRecheckAt.get(keyId) ?? 0
+    if (Date.now() - last < 10_000) return
+    quotaRecheckAt.set(keyId, Date.now())
+    try {
+      const orchestrator = pools.get(poolIdentity(poolState.provider, poolState.model))?.orchestrator
+      if (!orchestrator) return
+      const key = orchestrator.snapshot().keys.find((candidate) => candidate.id === keyId)
+      if (!key?.ref) return
+      const entry = await quota.manual(keyDefFor(poolState.provider, key))
+      if (!entry) return
+      if (entry.state === 'exhausted') {
+        orchestrator.noteQuotaExhausted(keyId, 'after-failure')
+        record({
+          action: 'quota',
+          pool: `${poolState.provider}/${poolState.model}`,
+          key: keyId,
+          detail: 'balance empty: key taken out of rotation',
+        })
+      }
+      // Deliberately no clearQuota here: this probe only ever takes a key OUT.
+      // Reviving stays with the scheduled probe, otherwise a provider that
+      // rejects for a reason the balance does not show (a 168h window, a frozen
+      // account) would be unparked one second after every failure.
+    } catch {
+      /* a probe that cannot answer changes nothing */
+    }
+  }
+
   /** Apply the penalty a classified failure earns its key. */
   function applyPenalty(poolState, keyId, failure, classified) {
     const orchestrator = pools.get(poolIdentity(poolState.provider, poolState.model))?.orchestrator
@@ -864,13 +1272,80 @@ export function apply(ctx) {
         cooldownFor(failure, { defaultMs: state.limits.defaultCooldownMs }),
       )
     }
+    // Whatever the provider said, ask its billing endpoint once: an unrecognised
+    // "no credit" wording then parks the key immediately instead of cooling it
+    // for two seconds and handing it the next request.
+    void probeAfterFailure(poolState, keyId)
+  }
+
+  /** The operator's note for one key, falling back to its id. */
+  const keyLabelOf = (provider, keyId) => {
+    const key = providerKeysOf(provider).find((candidate) => candidate.id === keyId)
+    return String(key?.note ?? keyId)
+  }
+
+  /** How many distinct credentials a provider has (one entry may repeat a key). */
+  const credentialCount = (provider) => schedulingKeysOf(provider).length
+
+  /**
+   * Show one request in the live window for as long as it exists.
+   *
+   * The row is created before the first attempt and removed in a `finally`, so a
+   * request that is admitted, retried, handed back to the agent loop or refused
+   * always leaves the window — a row never outlives its request.
+   * @param {any} options
+   * @param {() => AsyncIterable<any>} next
+   */
+  async function* runPooled(options, next) {
+    const provider = String(options?.provider ?? '')
+    const model = String(options?.model ?? '')
+    const poolState = poolStateOf(provider, model)
+    liveSeen.total += 1
+    if (!state.enabled || !poolState || credentialCount(provider) < 2) {
+      liveSeen.passthrough += 1
+      yield* next()
+      return
+    }
+    const sessionId = options?.sessionId
+    const rootId = rootSessionOf(sessionId)
+    const isChild = Boolean(sessionId && rootId && sessionId !== rootId)
+    // A subagent's name lives in a catalog read, so only a subagent request pays
+    // for it, once per tree per five seconds; a main request never waits.
+    if (isChild && agentLabelOf(sessionId) === '') await refreshSubagentNames(rootId, { force: true })
+    else void refreshSubagentNames(rootId)
+    const liveId = ++liveRowSeq
+    liveRows.set(liveId, {
+      id: liveId,
+      sessionId: String(sessionId ?? ''),
+      title: sessionTitleOf(rootId) || String(sessionId ?? '').slice(0, 8),
+      agent: agentLabelOf(sessionId),
+      lane: laneOf(sessionId) === 'main' ? 'main' : 'child',
+      provider,
+      model,
+      keyId: null,
+      keyLabel: null,
+      state: 'entering',
+      at: Date.now(),
+    })
+    writeLiveFile()
+    try {
+      yield* runPooledInner(options, next, liveId)
+    } finally {
+      const row = liveRows.get(liveId)
+      if (row) {
+        liveRows.delete(liveId)
+        liveDone.push({ ...row, endedAt: Date.now() })
+        if (liveDone.length > 120) liveDone.splice(0, liveDone.length - 120)
+      }
+      writeLiveFile()
+    }
   }
 
   /**
    * The `llm/stream` listener body. Returns an AsyncIterable synchronously so
    * the waterfall contract is satisfied; all waiting happens on first pull.
    */
-  async function* runPooled(options, next) {
+  async function* runPooledInner(options, next, liveId) {
     const provider = options?.provider
     const model = options?.model
     const poolState = poolStateOf(provider, model)
@@ -879,7 +1354,7 @@ export function apply(ctx) {
       return
     }
     const enabledKeys = enabledProviderKeys(poolState.provider)
-    if (enabledKeys.length < 2) {
+    if (enabledKeys.length < 2 || credentialCount(poolState.provider) < 2) {
       yield* next()
       return
     }
@@ -944,6 +1419,18 @@ export function apply(ctx) {
         return
       }
       correlation.set(sessionKey, { keyId: lease.keyId, secret, at: Date.now() })
+
+      // The window shows which key this request actually went out on, so the
+      // row learns it at the same instant the header does.
+      liveSeen.leased += 1
+      liveSeen.byKey[lease.keyId] = (liveSeen.byKey[lease.keyId] ?? 0) + 1
+      const liveRow = liveRows.get(liveId)
+      if (liveRow) {
+        liveRow.state = 'leased'
+        liveRow.keyId = lease.keyId
+        liveRow.keyLabel = keyLabelOf(provider, lease.keyId)
+        writeLiveFile()
+      }
 
       let result
       try {
@@ -1498,10 +1985,19 @@ export function apply(ctx) {
     return rows
   }
 
+  /** The version this build reports; read from its own package so it cannot drift. */
+  const buildVersion = (() => {
+    try {
+      return String(JSON.parse(fs.readFileSync(path.join(PACKAGE_DIR, 'package.json'), 'utf8')).version ?? '0.0.0')
+    } catch {
+      return '0.0.0'
+    }
+  })()
+
   const buildStatus = async () => {
     const catalog = await buildCatalog()
     return {
-    version: '0.4.4',
+    version: buildVersion,
     enabled: state.enabled === true,
     startedAt,
     savedAt: lastSavedAt || undefined,
@@ -1519,7 +2015,12 @@ export function apply(ctx) {
       recheckExhaustedMs: state.quota.recheckExhaustedMs,
     },
     laneFallback: state.laneFallback,
+    ui: { showLive: state.ui?.showLive !== false },
     credentials: { available: Boolean(credentialsService()) },
+    live: {
+      active: [...liveRows.values()].sort((a, b) => a.at - b.at),
+      recent: liveDone.slice(-40).reverse(),
+    },
     catalog,
     providers: await providerRows(catalog),
     pools: poolStates().map((poolState) => {
@@ -1748,6 +2249,28 @@ export function apply(ctx) {
         // The panel posts probe as a config op so one JSON shape covers it all.
         sendJson(response, 200, { ...(await probeKeys(body?.keyId)), status: await buildStatus() })
         return
+      } else if (op === 'set-live-visibility') {
+        state.ui.showLive = body?.show !== false
+        persist()
+        sendJson(response, 200, { ok: true, status: await buildStatus() })
+        return
+      } else if (op === 'test-key') {
+        // Deliberately outside the routing path: a connectivity test must not
+        // consume a conversation's lease, disturb the rotation, or park anything.
+        const provider = String(body?.provider ?? '').trim()
+        const keyId = String(body?.keyId ?? '')
+        const key = providerKeysOf(provider).find((candidate) => candidate.id === keyId)
+        if (!key) throw new Error(`unknown key ${keyId}`)
+        const result = await testKeyConnection(provider, key)
+        record({
+          action: 'test',
+          key: keyId,
+          detail: result.connected
+            ? `connected in ${result.ms}ms`
+            : `failed: ${String(result.detail).slice(0, 90)}`,
+        })
+        sendJson(response, 200, { ok: true, result, status: await buildStatus() })
+        return
       } else if (op === 'selftest') {
         sendJson(response, 200, await runSelftest(body))
         return
@@ -1797,12 +2320,73 @@ export function apply(ctx) {
     return { ok: true, probed }
   }
 
+  /**
+   * One real, deliberately tiny request: a one-character prompt asking for a
+   * single token. Success is "the provider accepted input and produced any
+   * output at all", which is the cheapest thing that proves a key works end to
+   * end — cheaper than a model list (no proof the key may generate) and far
+   * cheaper than a normal completion.
+   *
+   * The probe takes a real slot first (`testLease`), so a health check can never
+   * become the request that pushes a saturated key into a provider 429.
+   * @param {string} provider
+   * @param {any} key
+   */
+  async function testKeyConnection(provider, key) {
+    const secret = await getSecret(key.ref)
+    if (typeof secret !== 'string' || secret.length === 0) return { connected: false, detail: 'credential-unreadable' }
+    const base = String(baseURLFor(provider) ?? '').replace(/\/+$/, '')
+    if (base === '') return { connected: false, detail: 'no-base-url' }
+    const poolState = poolStates().find((candidate) => candidate.provider === provider)
+    const model = String(poolState?.model ?? '')
+    if (model === '') return { connected: false, detail: 'no-model-configured' }
+    const orchestrator = poolState
+      ? pools.get(poolIdentity(poolState.provider, poolState.model))?.orchestrator
+      : undefined
+    const lease = orchestrator ? await orchestrator.testLease(key.id, { waitMs: 8_000 }) : null
+    if (lease && lease.ok === false) {
+      return {
+        connected: false,
+        detail:
+          lease.reason === 'busy'
+            ? 'key is at its concurrency limit; no slot free within 8s'
+            : 'key is not part of a pool',
+      }
+    }
+    const started = Date.now()
+    try {
+      const response = await fetch(base + '/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${secret}` },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: '1' }], max_tokens: 1, stream: false }),
+        signal: AbortSignal.timeout(20_000),
+      })
+      const body = await response.text()
+      const ms = Date.now() - started
+      if (!response.ok) return { connected: false, ms, status: response.status, detail: body.slice(0, 160) }
+      let connected = body.length > 0
+      try {
+        const parsed = JSON.parse(body)
+        const choice = parsed?.choices?.[0]
+        const text = choice?.message?.content ?? choice?.text ?? ''
+        const tokens = Number(parsed?.usage?.completion_tokens ?? 0)
+        connected = String(text).length > 0 || tokens > 0
+      } catch {
+        /* a non-JSON 200 still counts when it carries bytes */
+      }
+      return { connected, ms, status: response.status, detail: connected ? 'ok' : 'no-output' }
+    } catch (error) {
+      return { connected: false, ms: Date.now() - started, detail: String(error?.message ?? error).slice(0, 160) }
+    } finally {
+      lease?.release?.()
+    }
+  }
+
   const probeRoute = async (request, response) => {
     if (request.method !== 'POST') {
       sendJson(response, 405, { ok: false, error: 'method not allowed' })
       return
-    }
-    let body = {}
+    }    let body = {}
     try {
       body = await readJsonBody(request)
     } catch (error) {
@@ -1966,6 +2550,9 @@ export function apply(ctx) {
       }
       // Inside the try: a throw here would reject the interval's promise, and an
       // unhandled rejection takes the whole Host process down with it.
+      // A secret re-issued in Settings must be noticed on its own: it changes
+      // which keys exist as scheduling units and invalidates that key's balance.
+      await refreshCredentialGraph()
       maintenance()
     } catch (error) {
       logLine(`housekeeping failed: ${String(error?.message ?? error)}`)
@@ -1975,6 +2562,10 @@ export function apply(ctx) {
   // -------------------------------------------------------------------- wiring
 
   rebuildPools()
+  // The credential graph decides how many slots a provider really has (two
+  // entries holding one secret are one key), so it is built before the first
+  // request reaches the pool rather than on the first housekeeping tick.
+  void refreshCredentialGraph()
 
   const listen = (name, handler) => {
     const disposer = ctx.on(name, handler)

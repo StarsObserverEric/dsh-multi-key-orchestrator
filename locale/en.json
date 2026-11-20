@@ -141,6 +141,17 @@
     "quota.deepseekUnsupported": "This provider does not expose a balance that can be read from here.",
     "common.unknownError": "Unknown error",
     "common.httpStatus": "HTTP {code}",
-    "log.action.fail": "failed"
+    "log.action.fail": "failed",
+    "key.test": "Test connection",
+    "key.testHint": "Sends one token and expects any reply back.",
+    "key.testOk": "connected in {ms} ms",
+    "key.testFail": "failed: {detail}",
+    "panel.showLive": "Overlay",
+    "live.title": "Live requests",
+    "live.inflight": "in flight",
+    "live.idle": "idle",
+    "live.laneMain": "main",
+    "live.laneChild": "sub",
+    "live.pending": "…"
   }
 }

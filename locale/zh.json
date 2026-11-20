@@ -141,6 +141,17 @@
     "quota.deepseekUnsupported": "这个服务方不提供可从这里读取的余额。",
     "common.unknownError": "未知错误",
     "common.httpStatus": "HTTP {code}",
-    "log.action.fail": "失败"
+    "log.action.fail": "失败",
+    "key.test": "测试连通性",
+    "key.testHint": "只发一个 token，收到任何回复即算连通。",
+    "key.testOk": "连通，耗时 {ms} ms",
+    "key.testFail": "失败：{detail}",
+    "panel.showLive": "浮窗",
+    "live.title": "实时请求",
+    "live.inflight": "在途",
+    "live.idle": "空闲",
+    "live.laneMain": "主",
+    "live.laneChild": "子",
+    "live.pending": "…"
   }
 }

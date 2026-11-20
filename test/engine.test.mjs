@@ -388,3 +388,73 @@ test('a per-key cap limits that key without shrinking the pool', async () => {
   assert.equal(fifthGranted, true)
   ;(await fifth).release()
 })
+
+test('a status-less 429 in the message still classifies as a rate limit', () => {
+  // The shape an ECNU adapter produced in the field: a code plus the raw body,
+  // no numeric status. This used to fall through to "other" and be re-thrown.
+  const classified = classifyFailure({
+    code: 'RATE_LIMIT',
+    message: '429 {"detail":"请求过于频繁，超过应用的每168小时 credits 限制"}',
+  })
+  assert.notEqual(classified.kind, 'other', 'a 429 must never be treated as unserveable')
+  assert.equal(classified.kind, 'quota', 'the wording is a budget limit, so the key steps aside')
+})
+
+test('credit wording in a status-less failure is treated as a budget problem', () => {
+  const classified = classifyFailure({ code: 'PROVIDER', message: '超过应用的每168小时 credits 限制' })
+  assert.equal(classified.kind, 'quota')
+})
+
+test('a connectivity test waits for a slot instead of overflowing a busy key', async () => {
+  const orchestrator = new PoolOrchestrator({
+    provider: 'ecnu',
+    model: 'ecnu-max',
+    maxConcurrent: 1,
+    reservedForMain: 0,
+    keys: [{ id: 'k1', ref: 'r1', note: 'one', maxConcurrent: 1, enabled: true }],
+  })
+  const held = await orchestrator.acquire({ lane: 'child', isEligible: () => true })
+  assert.ok(held, 'the real request got its slot')
+
+  // The key is full: a test must refuse rather than become the request that
+  // pushes the provider over its limit.
+  const busy = await orchestrator.testLease('k1', { waitMs: 60 })
+  assert.equal(busy.ok, false)
+  assert.equal(busy.reason, 'busy')
+
+  held.release()
+  const lease = await orchestrator.testLease('k1', { waitMs: 500 })
+  assert.equal(lease.ok, true, 'once a slot frees up the test proceeds')
+  assert.equal(orchestrator.snapshot().keys[0].activeLeases, 1, 'and it is counted')
+  lease.release()
+  assert.equal(orchestrator.snapshot().keys[0].activeLeases, 0)
+})
+
+test('a test never borrows the main lane nor a child slot', async () => {
+  const orchestrator = new PoolOrchestrator({
+    provider: 'ecnu',
+    model: 'ecnu-max',
+    maxConcurrent: 4,
+    reservedForMain: 1,
+    keys: [{ id: 'k1', ref: 'r1', note: 'one', maxConcurrent: 4, enabled: true }],
+  })
+  const lease = await orchestrator.testLease('k1', { waitMs: 200 })
+  assert.equal(lease.ok, true)
+  const snapshot = orchestrator.snapshot()
+  assert.equal(snapshot.lane.childLeases ?? 0, 0, 'no delegated slot was taken')
+  lease.release()
+})
+
+test('a provider ceiling never narrows admission below the operator total', () => {
+  const orchestrator = new PoolOrchestrator({
+    provider: 'ecnu',
+    model: 'ecnu-max',
+    maxConcurrent: 9,
+    keys: [{ id: 'k1', ref: 'r1', note: 'one', maxConcurrent: 3, enabled: true }],
+  })
+  assert.equal(orchestrator.softTotal, 9, 'an observation is not a limit')
+  orchestrator.setHardCeiling(5)
+  assert.equal(orchestrator.snapshot().hardCeiling, 5, 'the observation is recorded')
+  orchestrator.setMaxConcurrent(6)
+  assert.equal(orchestrator.softTotal, 5, 'and only narrows when it is enforced')
+})

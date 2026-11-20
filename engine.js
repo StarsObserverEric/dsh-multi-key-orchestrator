@@ -55,10 +55,15 @@ const DEFAULT_QUOTA_PATTERNS = Object.freeze([
   'credit balance',
   'out of credits',
   'credits exhausted',
+  'credits',
+  'credit limit',
   'payment required',
   '额度',
   '配额',
   '余额不足',
+  '限制',
+  '频繁',
+  '超过',
 ])
 
 /** Phrases that keep a 429 in the retryable class. */
@@ -151,7 +156,11 @@ export function maskSecret(secret) {
  * @returns {{ kind: string, retryAfterMs?: number, reason: string }}
  */
 export function classifyFailure(failure, patterns = {}) {
-  const status = Number(failure?.status ?? 0)
+  // Adapters sometimes hand over only a message ("429 {...}") with no status
+  // field. Treating that as status-less left a plain 429 classified as "other",
+  // which re-threw the failure instead of rotating away from a dead key.
+  const recovered = Number(/\b(4\d\d|5\d\d)\b/.exec(String(failure?.message ?? ''))?.[1] ?? 0)
+  const status = Number(failure?.status ?? 0) || recovered
   const haystack = `${failure?.code ?? ''} ${failure?.message ?? ''}`.toLowerCase()
 
   if (status === 401 || status === 403) {
@@ -286,6 +295,8 @@ export class PoolOrchestrator {
     this.keys = new Map()
     this.mainLeases = 0
     this.childLeases = 0
+    /** Slots held by connectivity tests: never a lane, always counted. */
+    this.testLeases = 0
     this.waiters = []
     this.cursor = 0
     this.seq = 0
@@ -310,6 +321,10 @@ export class PoolOrchestrator {
       provider: config?.provider ?? '',
       model: config?.model ?? '',
       maxConcurrent: Math.max(1, Number(config?.maxConcurrent ?? 4)),
+      // An observation only: what the provider *said* its own ceiling was. It
+      // never narrows admission unless the operator opts in, because the sum of
+      // the per-key caps is the operator's decision, not the provider's guess.
+      hardCeiling: Math.max(0, Number(config?.hardCeiling ?? 0)),
       reservedForMain: Math.max(0, Number(config?.reservedForMain ?? 1)),
       releaseReservationWhenIdle: config?.releaseReservationWhenIdle === true,
       idleGraceMs: Math.max(0, Number(config?.idleGraceMs ?? 30_000)),
@@ -370,7 +385,7 @@ export class PoolOrchestrator {
    * @param {string} lane
    */
   capacity(lane) {
-    const total = this.config.maxConcurrent
+    const total = this.softTotal
     if (lane !== LANE.child) return total
     const reserved = this.config.reservedForMain
     const idleFor = this.now() - this.lastMainActivityAt
@@ -384,6 +399,55 @@ export class PoolOrchestrator {
   }
 
   /**
+   * The total this pool may actually hold right now: the operator's sum, capped
+   * by an explicitly enforced provider ceiling. Everything that admits or counts
+   * capacity uses this, never `config.maxConcurrent` directly.
+   * @returns {number}
+   */
+  get softTotal() {
+    const ceiling = Math.max(0, Number(this.config?.hardCeiling ?? 0))
+    const total = Math.max(0, Number(this.config?.maxConcurrent ?? 0))
+    return ceiling > 0 ? Math.min(total, ceiling) : total
+  }
+
+  /**
+   * Resize the pool total in place. Raising it wakes queued requests at once;
+   * lowering it never preempts a lease that is already running.
+   * @param {number} value
+   */
+  setMaxConcurrent(value) {
+    const next = Math.max(1, Number(value) || 1)
+    const previous = Number(this.config.maxConcurrent ?? 0)
+    if (next === previous) return next
+    this.config.maxConcurrent = next
+    this.onEvent({
+      action: 'capacity',
+      pool: this.id,
+      detail: 'total ' + previous + ' -> ' + next + ' (admit ' + this.softTotal + ')',
+    })
+    if (this.softTotal > previous) this.pump()
+    return next
+  }
+
+  /**
+   * Record a provider-reported ceiling. Storage only — `enforceCeiling` decides
+   * whether it narrows admission.
+   * @param {number} value
+   */
+  setHardCeiling(value) {
+    const next = Math.max(0, Number(value) || 0)
+    if (next === Number(this.config.hardCeiling ?? 0)) return next
+    this.config.hardCeiling = next
+    this.onEvent({
+      action: 'capacity',
+      pool: this.id,
+      detail: 'provider ceiling ' + next + ' (admit ' + this.softTotal + ')',
+    })
+    if (this.softTotal > this.activeLeases) this.pump()
+    return next
+  }
+
+  /**
    * @param {string} lane
    * @param {(key: any) => boolean} [isEligible] caller-supplied gate (quota, etc.)
    */
@@ -392,7 +456,7 @@ export class PoolOrchestrator {
     // The provider-wide cap spans every model of this provider, so it is
     // checked before any of this pool's own limits.
     if (this.providerGate && !this.providerGate.hasRoom()) return false
-    if (this.activeLeases >= this.config.maxConcurrent) return false
+    if (this.activeLeases >= this.softTotal) return false
     if (lane === LANE.child && this.childLeases >= this.capacity(LANE.child)) return false
     return Boolean(this.selectKey(isEligible))
   }
@@ -507,11 +571,67 @@ export class PoolOrchestrator {
   tryGrant(lane, isEligible) {
     if (this.disposed) return undefined
     if (this.providerGate && !this.providerGate.hasRoom()) return undefined
-    if (this.activeLeases >= this.config.maxConcurrent) return undefined
+    if (this.activeLeases >= this.softTotal) return undefined
     if (lane === LANE.child && this.childLeases >= this.capacity(LANE.child)) return undefined
     const key = this.selectKey(isEligible)
     if (!key) return undefined
     return this.createLease(key, lane)
+  }
+
+  /**
+   * Reserve one real provider slot for a connectivity test.
+   *
+   * A test is a genuine request: it gets the same per-key ceiling and the same
+   * provider gate as a conversation, so it can never push a key past the number
+   * of requests the provider tolerates. It deliberately takes neither the main
+   * lane (reserved for what the operator types) nor a child slot (reserved for
+   * delegated work) — it is not a conversation, so it must not starve one.
+   * When no slot frees up in time the caller is told, instead of the test
+   * waiting forever or forcing a 429.
+   *
+   * @param {string} keyId
+   * @param {{ waitMs?: number }} [options]
+   */
+  async testLease(keyId, options = {}) {
+    const key = this.keys.get(String(keyId))
+    if (!key) return { ok: false, reason: 'unknown-key' }
+    const waitMs = Math.max(0, Number(options.waitMs ?? 8_000))
+    const deadline = this.now() + waitMs
+    const hasRoom = () => {
+      if (key.maxConcurrent > 0 && key.activeLeases >= key.maxConcurrent) return false
+      if (this.activeLeases + this.testLeases >= this.softTotal) return false
+      if (this.providerGate && !this.providerGate.hasRoom()) return false
+      return true
+    }
+    while (!hasRoom()) {
+      if (this.now() >= deadline) return { ok: false, reason: 'busy' }
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    key.activeLeases += 1
+    this.testLeases += 1
+    this.providerGate?.acquire()
+    const at = this.now()
+    let released = false
+    return {
+      ok: true,
+      keyId: key.id,
+      release: () => {
+        if (released) return
+        released = true
+        const live = this.keys.get(key.id)
+        if (live) live.activeLeases = Math.max(0, live.activeLeases - 1)
+        this.testLeases = Math.max(0, this.testLeases - 1)
+        this.providerGate?.release()
+        this.onEvent({
+          action: 'release',
+          pool: this.id,
+          key: key.id,
+          lane: 'test',
+          detail: 'test held ' + (this.now() - at) + 'ms',
+        })
+        this.pump()
+      },
+    }
   }
 
   /** @param {any} key @param {string} lane */
@@ -769,6 +889,8 @@ export class PoolOrchestrator {
       provider: this.config.provider,
       model: this.config.model,
       maxConcurrent: this.config.maxConcurrent,
+      hardCeiling: Math.max(0, Number(this.config.hardCeiling ?? 0)),
+      admitTotal: this.softTotal,
       reservedForMain: this.config.reservedForMain,
       releaseReservationWhenIdle: this.config.releaseReservationWhenIdle,
       providerGate: this.providerGate ? this.providerGate.snapshot() : null,
@@ -777,6 +899,7 @@ export class PoolOrchestrator {
         childLeases: this.childLeases,
         childCapacity: this.capacity(LANE.child),
         total: this.activeLeases,
+        testLeases: this.testLeases,
         waiting: this.waiters.length,
       },
       keys: [...this.keys.values()].map((key) => this.projectKey(key, now)),

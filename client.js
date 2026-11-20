@@ -1,13 +1,16 @@
 /**
  * dsh-multi-key-orchestrator — Client half.
  *
- * Two seats, both registered from `apply`:
+ * Three seats, all registered from `apply`:
  *   - `sidebar.panellist` (order 21): the icon that puts the page in the
  *     sidebar, directly under Context Insights. The sidebar owns the button and
  *     resolves the label; this file supplies the glyph.
  *   - `main` (keyed `multi-key-orchestrator`): the page itself, an ordinary
- *     scroll container and the plugin's only surface. There is no footer pill
- *     and no dialog.
+ *     scroll container and the plugin's only settings surface.
+ *   - `shell.overlay` (order 60): the floating live monitor — where the
+ *     requests in flight actually are, a bar to collapse it, and a drag handle.
+ *
+ * There is no footer pill and no dialog.
  *
  * The page is driven by the Host catalog: one collapsible section per provider,
  * collapsed by default. API keys belong to the provider (one key set shared by
@@ -75,6 +78,13 @@ window.__ModuleLoader__.load({
       track: 'rgba(127,127,127,.24)',
       thumb: 'var(--dsw-alias-switch-thumb, #fff)',
       shadow: 'var(--dsw-elevation-prominent, 0 12px 32px rgba(0,0,0,.34))',
+      // The floating window's own surface. A Wallpaper Engine plugin paints the
+      // glass for overlay frames, so this file only sets colour — never a
+      // backdrop filter and never a colour mix, both of which break that glass.
+      overlay: 'var(--dsw-alias-bg-overlay, #232324)',
+      borderL1: 'var(--dsw-alias-border-l1, rgba(127,127,127,.30))',
+      brand: 'var(--dsw-alias-brand-primary, #4a8cff)',
+      label: 'var(--dsw-alias-label-primary, inherit)',
     })
 
     //#region dictionaries
@@ -230,6 +240,20 @@ window.__ModuleLoader__.load({
       'quota.deepseekUnsupported': 'This provider does not expose a balance that can be read from here.',
       'common.unknownError': 'Unknown error',
       'common.httpStatus': 'HTTP {code}',
+
+      'key.test': 'Test connection',
+      'key.testHint': 'Sends one token and expects any reply back.',
+      'key.testOk': 'connected in {ms} ms',
+      'key.testFail': 'failed: {detail}',
+
+      'panel.showLive': 'Overlay',
+
+      'live.title': 'Live requests',
+      'live.inflight': 'in flight',
+      'live.idle': 'idle',
+      'live.laneMain': 'main',
+      'live.laneChild': 'sub',
+      'live.pending': '…',
     }
 
     const ZH = {
@@ -383,6 +407,20 @@ window.__ModuleLoader__.load({
       'quota.deepseekUnsupported': '这个服务方不提供可从这里读取的余额。',
       'common.unknownError': '未知错误',
       'common.httpStatus': 'HTTP {code}',
+
+      'key.test': '测试连通性',
+      'key.testHint': '只发一个 token，收到任何回复即算连通。',
+      'key.testOk': '连通，耗时 {ms} ms',
+      'key.testFail': '失败：{detail}',
+
+      'panel.showLive': '浮窗',
+
+      'live.title': '实时请求',
+      'live.inflight': '在途',
+      'live.idle': '空闲',
+      'live.laneMain': '主',
+      'live.laneChild': '子',
+      'live.pending': '…',
     }
 
     const DICT = { en: EN, zh: ZH }
@@ -1420,11 +1458,14 @@ window.__ModuleLoader__.load({
      * A key added here can be removed.
      */
     function ProviderKeyRow(props) {
-      const { provider, entry, now, busy, drafts, writeDraft, confirming, onAskRemove, onRemove, onProbe } = props
+      const { provider, entry, now, busy, drafts, writeDraft, confirming, onAskRemove, onRemove, onProbe, testResults, onTestKey } = props
       const disabled = busy !== null
       const keyId = entry.id === undefined || entry.id === null ? '' : String(entry.id)
       const noteId = 'note:' + provider + ':' + keyId
       const enabledId = 'enabled:' + provider + ':' + keyId
+      const results = testResults === null || testResults === undefined || typeof testResults !== 'object' ? {} : testResults
+      const testState = results[provider + ':' + keyId] === undefined ? null : results[provider + ':' + keyId]
+      const testing = busy === 'test-key:' + provider + ':' + keyId
       const originalNote = noteOf(entry)
       const originalEnabled = entry.enabled !== false
       const noteValue = drafts[noteId] !== undefined ? String(drafts[noteId].value) : originalNote
@@ -1448,6 +1489,19 @@ window.__ModuleLoader__.load({
         ? t('key.noFailures')
         : t('key.failures', { n: fmtNum(failures), m: fmtNum(hits) })
       const lastOkText = lastOk === null ? t('key.neverSucceeded') : t('key.lastOk', { time: relPast(lastOk, now) })
+
+      // What the last connectivity test said, in the operator's own words.
+      let testText = ''
+      if (testState !== null && testState !== undefined && typeof testState === 'object') {
+        if (testState.connected === true) {
+          testText = t('key.testOk', { ms: fmtNum(typeof testState.ms === 'number' ? testState.ms : 0) })
+        } else {
+          const detail = typeof testState.detail === 'string' && testState.detail !== ''
+            ? testState.detail
+            : (typeof testState.status === 'number' ? t('common.httpStatus', { code: testState.status }) : t('common.unknownError'))
+          testText = t('key.testFail', { detail })
+        }
+      }
 
       return h(
         'div',
@@ -1516,6 +1570,13 @@ window.__ModuleLoader__.load({
                 }),
                 h('span', { key: 'text' }, t('key.enabled')),
               ]),
+              h(Btn, {
+                key: 'test',
+                size: 'sm',
+                disabled,
+                title: t('key.testHint'),
+                onClick: () => onTestKey(entry.id),
+              }, testing ? t('key.probing') : t('key.test')),
               removable
                 ? h(Btn, {
                   key: 'remove',
@@ -1528,6 +1589,19 @@ window.__ModuleLoader__.load({
                 })
                 : null,
             ]),
+            testText === ''
+              ? null
+              : h('p', {
+                key: 'testResult',
+                role: 'status',
+                style: {
+                  margin: 0,
+                  fontSize: 11,
+                  lineHeight: '16px',
+                  color: testState !== null && testState !== undefined && testState.connected === true ? C.dim : C.red,
+                  wordBreak: 'break-word',
+                },
+              }, testText),
             missing
               ? h(Hint, { key: 'missing' }, t('key.missingCredential'))
               : null,
@@ -1856,8 +1930,8 @@ window.__ModuleLoader__.load({
     function ProviderSection(props) {
       const {
         provider, displayName, status, models, poolIndex, providerKeys, expanded, onToggle,
-        now, busy, confirming, drafts, writeDraft,
-        onAddProviderKey, onRemoveProviderKey, onAskRemove, onProbe, onProbeAll,
+        now, busy, confirming, drafts, writeDraft, testResults,
+        onAddProviderKey, onRemoveProviderKey, onAskRemove, onProbe, onProbeAll, onTestKey,
       } = props
       const disabled = busy !== null
       const cap = status !== null && status !== undefined && typeof status.maxConcurrent === 'number'
@@ -1960,6 +2034,8 @@ window.__ModuleLoader__.load({
                       onAskRemove: (keyId) => onAskRemove(keyId),
                       onRemove: (keyId) => onRemoveProviderKey(provider, keyId),
                       onProbe,
+                      testResults,
+                      onTestKey: (keyId) => onTestKey(provider, keyId),
                     }))),
                 h(AddProviderKeyForm, {
                   key: 'add',
@@ -2139,6 +2215,7 @@ window.__ModuleLoader__.load({
       const [selftestLog, setSelftestLog] = useState([])
       const [selftestNote, setSelftestNote] = useState(null)
       const [inject429, setInject429] = useState(false)
+      const [testResults, setTestResults] = useState({})
 
       const status = store.status
       const statusError = store.error
@@ -2153,6 +2230,10 @@ window.__ModuleLoader__.load({
       const pools = status !== null && status !== undefined && Array.isArray(status.pools) ? status.pools : []
       const catalog = status !== null && status !== undefined && Array.isArray(status.catalog) ? status.catalog : []
       const providers = status !== null && status !== undefined && Array.isArray(status.providers) ? status.providers : []
+      const ui = status !== null && status !== undefined && status.ui !== null && status.ui !== undefined && typeof status.ui === 'object'
+        ? status.ui
+        : null
+      const showLive = ui === null || ui.showLive !== false
 
       useEffect(() => {
         refreshStatus()
@@ -2210,6 +2291,38 @@ window.__ModuleLoader__.load({
       const probeKey = (keyId) => run('probe:' + String(keyId), () => postConfig({ op: 'probe', keyId }))
 
       const probeAll = () => run('probe:all', () => postConfig({ op: 'probe' }))
+
+      /**
+       * Send one token through one key. The answer is kept per key — keyed
+       * `provider:keyId` — so the row can print it under its own actions
+       * instead of raising a page-wide banner for a healthy key.
+       */
+      const testKey = async (provider, keyId) => {
+        const id = provider + ':' + String(keyId)
+        setBusy('test-key:' + id)
+        setActionError(null)
+        let entry = { connected: false, ms: null, status: null, detail: t('common.unknownError') }
+        try {
+          const payload = await postConfig({ op: 'test-key', provider, keyId })
+          const result = payload !== null && payload !== undefined && typeof payload === 'object'
+            && payload.result !== null && payload.result !== undefined && typeof payload.result === 'object'
+            ? payload.result
+            : null
+          entry = {
+            connected: result !== null && result.connected === true,
+            ms: result !== null && typeof result.ms === 'number' ? result.ms : null,
+            status: result !== null && typeof result.status === 'number' ? result.status : null,
+            detail: result !== null && typeof result.detail === 'string' ? result.detail : '',
+          }
+        } catch (reason) {
+          entry = { connected: false, ms: null, status: null, detail: messageOf(reason) }
+        }
+        setTestResults((previous) => ({ ...previous, [id]: entry }))
+        setBusy(null)
+        if (entry.connected === true) await refreshStatus()
+      }
+
+      const toggleShowLive = (next) => run('live', () => postConfig({ op: 'set-live-visibility', show: next }))
 
       const runSelftest = async () => {
         setBusy('selftest')
@@ -2482,11 +2595,13 @@ window.__ModuleLoader__.load({
             confirming: confirmingKey,
             drafts,
             writeDraft,
+            testResults,
             onAddProviderKey: addProviderKey,
             onRemoveProviderKey: removeProviderKey,
             onAskRemove: (keyId) => setConfirmingKey(String(keyId)),
             onProbe: probeKey,
             onProbeAll: probeAll,
+            onTestKey: testKey,
           }))
         }
       }
@@ -2585,6 +2700,16 @@ window.__ModuleLoader__.load({
                   onChange: toggleEnabled,
                 }),
               ]),
+              h('div', { key: 'showLive', style: { display: 'flex', alignItems: 'center', flex: 'none' } }, [
+                h(Switch, {
+                  key: 'switch',
+                  checked: showLive,
+                  disabled: busy !== null,
+                  label: t('panel.showLive'),
+                  ariaLabel: t('panel.showLive'),
+                  onChange: toggleShowLive,
+                }),
+              ]),
             ]),
           ]),
           statusError !== null && statusError !== undefined
@@ -2648,6 +2773,486 @@ window.__ModuleLoader__.load({
 
     //#endregion
 
+    //#region live monitor
+
+    /** Where the floating window's top-left corner is remembered. */
+    const LIVE_POS_KEY = 'mko.live.pos'
+    /** How far the pointer may wander before a press counts as a drag. */
+    const LIVE_DRAG_SLOP = 4
+    /** How long a finished drag swallows the click that follows it. */
+    const LIVE_CLICK_SWALLOW_MS = 400
+    /** Poll cadence: quick while the body is open, lazy while it is a strip. */
+    const LIVE_POLL_OPEN_MS = 800
+    const LIVE_POLL_COLLAPSED_MS = 2500
+    /** The two widths: the body needs five columns, the strip needs a title. */
+    const LIVE_WIDTH_OPEN = 520
+    const LIVE_WIDTH_COLLAPSED = 240
+
+    /** The viewport width, with a usable default when the host answers nothing. */
+    function viewportWidth() {
+      const width = typeof window === 'undefined' ? 0 : window.innerWidth
+      return typeof width === 'number' && Number.isFinite(width) && width > 0 ? width : 1024
+    }
+
+    /** The viewport height, with a usable default when the host answers nothing. */
+    function viewportHeight() {
+      const height = typeof window === 'undefined' ? 0 : window.innerHeight
+      return typeof height === 'number' && Number.isFinite(height) && height > 0 ? height : 768
+    }
+
+    /** The window's width for the current open / collapsed state. */
+    function liveWidth(open) {
+      return open === true ? LIVE_WIDTH_OPEN : LIVE_WIDTH_COLLAPSED
+    }
+
+    /**
+     * Push a corner back inside the viewport. The window is anchored by its
+     * top-left corner, so a maximise, a restore or a collapsed width must never
+     * leave that corner — or the window's right edge — outside the editor.
+     */
+    function clampLivePos(pos, open) {
+      const left = pos !== null && pos !== undefined && typeof pos.left === 'number' && Number.isFinite(pos.left) ? pos.left : 8
+      const top = pos !== null && pos !== undefined && typeof pos.top === 'number' && Number.isFinite(pos.top) ? pos.top : 8
+      const maxLeft = Math.max(8, viewportWidth() - liveWidth(open) - 8)
+      const maxTop = Math.max(8, viewportHeight() - 48)
+      return {
+        left: Math.min(Math.max(8, left), maxLeft),
+        top: Math.min(Math.max(8, top), maxTop),
+      }
+    }
+
+    /** Bottom-right-ish, so the window never covers the conversation it watches. */
+    function defaultLivePos() {
+      return {
+        left: Math.max(8, viewportWidth() - 560),
+        top: Math.max(8, viewportHeight() - 362),
+      }
+    }
+
+    /** The remembered corner, or null when nothing usable is stored. */
+    function readLivePos() {
+      try {
+        if (typeof window === 'undefined') return null
+        const storage = window.localStorage
+        if (storage === null || storage === undefined) return null
+        const raw = storage.getItem(LIVE_POS_KEY)
+        if (typeof raw !== 'string' || raw === '') return null
+        const parsed = JSON.parse(raw)
+        if (parsed === null || parsed === undefined || typeof parsed !== 'object') return null
+        if (typeof parsed.left !== 'number' || !Number.isFinite(parsed.left)) return null
+        if (typeof parsed.top !== 'number' || !Number.isFinite(parsed.top)) return null
+        return { left: parsed.left, top: parsed.top }
+      } catch (error) {
+        return null
+      }
+    }
+
+    /** Remember the corner. A storage that refuses (private mode) is not fatal. */
+    function writeLivePos(pos) {
+      try {
+        if (typeof window === 'undefined') return
+        const storage = window.localStorage
+        if (storage === null || storage === undefined) return
+        storage.setItem(LIVE_POS_KEY, JSON.stringify({ left: Math.round(pos.left), top: Math.round(pos.top) }))
+      } catch (error) {
+        // Storage is a convenience here: the window still works without it.
+      }
+    }
+
+    /** One key of a pool as `note:active/max`, the compact form the bar uses. */
+    function liveKeyCount(key) {
+      const note = key !== null && key !== undefined && typeof key.note === 'string' && key.note !== ''
+        ? key.note
+        : (key !== null && key !== undefined && key.id !== undefined && key.id !== null ? String(key.id) : t('common.dash'))
+      const active = key !== null && key !== undefined && typeof key.activeLeases === 'number' ? key.activeLeases : 0
+      const max = key !== null && key !== undefined && typeof key.maxConcurrent === 'number' ? key.maxConcurrent : 0
+      return note + ':' + active + '/' + max
+    }
+
+    /** The label a request row shows for the key serving it. */
+    function liveKeyLabel(row) {
+      return row !== null && row !== undefined && typeof row.keyLabel === 'string' && row.keyLabel !== ''
+        ? row.keyLabel
+        : (row !== null && row !== undefined && row.keyId !== undefined && row.keyId !== null ? String(row.keyId) : t('common.dash'))
+    }
+
+    /** The lanes text: `…` while a request is still entering, then 主 / 子. */
+    function liveLaneText(row) {
+      if (row !== null && row !== undefined && row.state === 'entering') return t('live.pending')
+      return t(row !== null && row !== undefined && row.lane === 'main' ? 'live.laneMain' : 'live.laneChild')
+    }
+
+    /**
+     * One summary block per model with requests in flight: the model's own
+     * count against its pool total, then every key of that pool — idle keys
+     * included, because an idle key is exactly what an operator is looking for.
+     */
+    function liveGroups(active, pools) {
+      const poolIndex = new Map()
+      for (const pool of pools) {
+        if (pool === null || pool === undefined || typeof pool !== 'object') continue
+        if (typeof pool.provider !== 'string' || typeof pool.model !== 'string') continue
+        poolIndex.set(pool.provider + '\u0000' + pool.model, pool)
+      }
+      const groups = []
+      const seen = new Map()
+      for (const row of active) {
+        const provider = typeof row.provider === 'string' ? row.provider : ''
+        const model = typeof row.model === 'string' && row.model !== '' ? row.model : t('common.dash')
+        const id = provider + '\u0000' + model
+        let group = seen.get(id)
+        if (group === undefined) {
+          const pool = poolIndex.get(id) === undefined ? null : poolIndex.get(id)
+          const keys = pool !== null && Array.isArray(pool.keys)
+            ? pool.keys.filter((key) => key !== null && key !== undefined && typeof key === 'object')
+            : []
+          group = {
+            id,
+            model,
+            count: 0,
+            total: pool !== null && typeof pool.maxConcurrent === 'number' ? pool.maxConcurrent : null,
+            keys: keys.map((key) => ({
+              id: key.id === undefined || key.id === null ? '' : String(key.id),
+              text: liveKeyCount(key),
+              exhausted: key.state === 'quota_exhausted',
+            })),
+          }
+          seen.set(id, group)
+          groups.push(group)
+        }
+        group.count += 1
+      }
+      return groups
+    }
+
+    /** In-flight rows, by model and then by the key label serving them. */
+    function liveRows(active) {
+      return active.slice().sort((left, right) => {
+        const byModel = String(left.model).localeCompare(String(right.model))
+        if (byModel !== 0) return byModel
+        return liveKeyLabel(left).localeCompare(liveKeyLabel(right))
+      })
+    }
+
+    /**
+     * One in-flight request: conversation (and subagent), lane, model, key and
+     * how many seconds it has been waiting. The columns are a fixed grid so the
+     * rows line up no matter how long a title is.
+     */
+    function LiveRequestRow(props) {
+      const row = props.row !== null && props.row !== undefined && typeof props.row === 'object' ? props.row : {}
+      const title = typeof row.title === 'string' && row.title !== '' ? row.title : t('common.dash')
+      const agent = typeof row.agent === 'string' ? row.agent : ''
+      const model = typeof row.model === 'string' && row.model !== '' ? row.model : t('common.dash')
+      const keyLabel = liveKeyLabel(row)
+      const at = toMs(row.at)
+      const seconds = at === null ? null : Math.max(0, Math.floor((props.now - at) / 1000))
+      const cell = { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0 }
+      return h(
+        'div',
+        {
+          title: title + (agent === '' ? '' : ' › ' + agent),
+          style: {
+            display: 'grid',
+            gridTemplateColumns: 'minmax(0,1fr) 42px 78px 58px 44px',
+            alignItems: 'baseline',
+            columnGap: 8,
+            padding: '2px 10px',
+            fontSize: 12,
+            lineHeight: '18px',
+            fontFamily: MONO,
+            fontVariantNumeric: 'tabular-nums',
+            color: C.label,
+          },
+        },
+        [
+          h('span', { key: 'name', style: cell }, title + (agent === '' ? '' : ' › ' + agent)),
+          h('span', { key: 'lane', style: { ...cell, color: C.dim, textAlign: 'center' } }, liveLaneText(row)),
+          h('span', { key: 'model', style: { ...cell, color: C.dim } }, model),
+          h('span', { key: 'key', style: cell }, keyLabel),
+          h('span', {
+            key: 'elapsed',
+            style: { flex: 'none', textAlign: 'right', color: C.faint, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' },
+          }, seconds === null ? t('common.dash') : seconds + 's'),
+        ],
+      )
+    }
+
+    /**
+     * The floating live monitor (`shell.overlay`).
+     *
+     * It is pinned by its top-left corner: opening grows it down and to the
+     * right, so the bar the operator just pressed stays under the cursor and a
+     * second press always lands on that bar again. The bar is both the drag
+     * handle and the toggle, and a drag that moved more than four pixels
+     * swallows the click that arrives with it.
+     *
+     * The corner is remembered in `localStorage`; a resize or a collapse
+     * re-clamps it back inside the viewport. Hiding the window only stops the
+     * painting — the poll keeps running, so the settings switch brings it back
+     * without a reload.
+     */
+    function LiveMonitor() {
+      useLocaleId()
+      const store = useSyncExternalStore(subscribeStatus, getStatusSnapshot, getStatusSnapshot)
+      const [open, setOpen] = useState(true)
+      const [pos, setPos] = useState(() => {
+        const stored = readLivePos()
+        return clampLivePos(stored === null ? defaultLivePos() : stored, true)
+      })
+      const [now, setNow] = useState(() => Date.now())
+      const dragRef = useRef(null)
+      const swallowUntilRef = useRef(0)
+
+      const status = store.status
+      const ui = status !== null && status !== undefined && status.ui !== null && status.ui !== undefined && typeof status.ui === 'object'
+        ? status.ui
+        : null
+      const visible = ui === null || ui.showLive !== false
+      const live = status !== null && status !== undefined && status.live !== null && status.live !== undefined && typeof status.live === 'object'
+        ? status.live
+        : null
+      const active = live !== null && Array.isArray(live.active)
+        ? live.active.filter((row) => row !== null && row !== undefined && typeof row === 'object')
+        : []
+      const pools = status !== null && status !== undefined && Array.isArray(status.pools) ? status.pools : []
+
+      // Poll while visible or not: the switch must be able to bring the window
+      // back without a reload, and a hidden window costs one small GET.
+      useEffect(() => {
+        refreshStatus()
+        const period = open === true ? LIVE_POLL_OPEN_MS : LIVE_POLL_COLLAPSED_MS
+        const timer = setInterval(() => {
+          refreshStatus()
+        }, period)
+        return () => clearInterval(timer)
+      }, [open])
+
+      // Elapsed seconds only need a clock while the rows are on screen.
+      useEffect(() => {
+        if (open !== true) return undefined
+        const timer = setInterval(() => setNow(Date.now()), 1000)
+        return () => clearInterval(timer)
+      }, [open])
+
+      // Every move is the operator's intent, so the stored corner follows it.
+      useEffect(() => {
+        writeLivePos(pos)
+      }, [pos.left, pos.top])
+
+      // A resize, a maximise or a restore must never leave the window outside.
+      useEffect(() => {
+        const reclamp = () => {
+          setPos((previous) => {
+            const corrected = clampLivePos(previous, open === true)
+            return corrected.left === previous.left && corrected.top === previous.top ? previous : corrected
+          })
+        }
+        reclamp()
+        if (typeof window.addEventListener !== 'function') return undefined
+        window.addEventListener('resize', reclamp)
+        return () => window.removeEventListener('resize', reclamp)
+      }, [open])
+
+      // The drag runs on window listeners so the pointer may leave the bar.
+      useEffect(() => {
+        if (typeof window.addEventListener !== 'function') return undefined
+        const onMove = (event) => {
+          const drag = dragRef.current
+          if (drag === null) return
+          const dx = typeof event.clientX === 'number' ? event.clientX - drag.startX : 0
+          const dy = typeof event.clientY === 'number' ? event.clientY - drag.startY : 0
+          if (!Number.isFinite(dx) || !Number.isFinite(dy)) return
+          if (drag.moved !== true && Math.abs(dx) <= LIVE_DRAG_SLOP && Math.abs(dy) <= LIVE_DRAG_SLOP) return
+          drag.moved = true
+          setPos(clampLivePos({ left: drag.startLeft + dx, top: drag.startTop + dy }, open === true))
+        }
+        const onUp = () => {
+          const drag = dragRef.current
+          if (drag === null) return
+          dragRef.current = null
+          // The click that follows a real drag must not collapse the window.
+          if (drag.moved === true) swallowUntilRef.current = Date.now() + LIVE_CLICK_SWALLOW_MS
+        }
+        window.addEventListener('pointermove', onMove)
+        window.addEventListener('pointerup', onUp)
+        window.addEventListener('pointercancel', onUp)
+        return () => {
+          window.removeEventListener('pointermove', onMove)
+          window.removeEventListener('pointerup', onUp)
+          window.removeEventListener('pointercancel', onUp)
+        }
+      }, [open])
+
+      const onBarPointerDown = (event) => {
+        if (event === null || event === undefined) return
+        if (typeof event.button === 'number' && event.button !== 0) return
+        dragRef.current = {
+          startX: typeof event.clientX === 'number' ? event.clientX : 0,
+          startY: typeof event.clientY === 'number' ? event.clientY : 0,
+          startLeft: pos.left,
+          startTop: pos.top,
+          moved: false,
+        }
+      }
+
+      const onBarClick = () => {
+        if (Date.now() < swallowUntilRef.current) {
+          swallowUntilRef.current = 0
+          return
+        }
+        const next = open !== true
+        setOpen(next)
+        // Collapsing narrows the window: the corner has to be re-clamped.
+        setPos((previous) => clampLivePos(previous, next))
+      }
+
+      if (visible !== true) return null
+
+      const rows = liveRows(active)
+      const groups = liveGroups(active, pools)
+      const rowsMaxHeight = 'min(42vh, ' + Math.max(60, Math.round(viewportHeight() - pos.top - 56)) + 'px)'
+
+      const bar = h('button', {
+        key: 'bar',
+        type: 'button',
+        'aria-expanded': open === true,
+        'aria-label': t('live.title') + ' — ' + t(open === true ? 'provider.collapse' : 'provider.expand'),
+        title: t(open === true ? 'provider.collapse' : 'provider.expand'),
+        onClick: onBarClick,
+        onPointerDown: onBarPointerDown,
+        style: {
+          display: 'flex',
+          alignItems: 'center',
+          gap: 6,
+          width: '100%',
+          boxSizing: 'border-box',
+          flex: 'none',
+          height: 26,
+          padding: '0 8px',
+          margin: 0,
+          border: 'none',
+          borderBottom: open === true ? C.lineSoft : 'none',
+          background: 'transparent',
+          color: 'inherit',
+          font: 'inherit',
+          fontFamily: MONO,
+          fontSize: 12,
+          lineHeight: '18px',
+          textAlign: 'left',
+          cursor: 'grab',
+          touchAction: 'none',
+          userSelect: 'none',
+        },
+      }, [
+        h('span', { key: 'chevron', 'aria-hidden': 'true', style: { flex: 'none', color: C.faint } }, open === true ? '▴' : '▾'),
+        h('span', {
+          key: 'title',
+          style: { flex: '1 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+        }, t('live.title')),
+        h('span', {
+          key: 'count',
+          style: {
+            flex: 'none',
+            fontVariantNumeric: 'tabular-nums',
+            color: rows.length > 0 ? C.brand : C.faint,
+          },
+        }, String(rows.length) + ' ' + t('live.inflight')),
+      ])
+
+      const body = []
+      if (rows.length === 0) {
+        body.push(h('div', {
+          key: 'idle',
+          style: { padding: '6px 10px', fontSize: 12, lineHeight: '18px', color: C.faint, fontFamily: MONO },
+        }, t('live.idle')))
+      } else {
+        for (const group of groups) {
+          const keyChildren = []
+          for (const key of group.keys) {
+            keyChildren.push(h('span', {
+              key: 'key:' + key.id,
+              style: { flex: 'none', color: key.exhausted ? C.faint : C.dim },
+            }, [
+              h('span', { key: 'text' }, key.text),
+              key.exhausted ? h('span', { key: 'mark', style: { color: C.red } }, '⛔') : null,
+            ]))
+          }
+          body.push(h('div', {
+            key: 'group:' + group.id,
+            style: { display: 'flex', flexDirection: 'column', gap: 1, padding: '4px 10px 2px' },
+          }, [
+            h('div', { key: 'model', style: { display: 'flex', alignItems: 'baseline', gap: 8, minWidth: 0 } }, [
+              h('span', {
+                key: 'name',
+                style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: C.label },
+              }, group.model),
+              h('span', {
+                key: 'count',
+                style: { flex: 'none', color: C.dim, fontVariantNumeric: 'tabular-nums' },
+              }, String(group.count) + '/' + (group.total === null ? t('common.dash') : String(group.total))),
+            ]),
+            h('div', {
+              key: 'keys',
+              style: {
+                display: 'flex',
+                flexWrap: 'wrap',
+                alignItems: 'baseline',
+                columnGap: 12,
+                rowGap: 2,
+                fontSize: 11,
+                lineHeight: '16px',
+                color: C.faint,
+                fontVariantNumeric: 'tabular-nums',
+              },
+            }, keyChildren.length === 0 ? [h('span', { key: 'none' }, t('common.dash'))] : keyChildren),
+          ]))
+        }
+        body.push(h('div', {
+          key: 'rows',
+          style: {
+            display: 'flex',
+            flexDirection: 'column',
+            maxHeight: rowsMaxHeight,
+            overflowY: 'auto',
+            overflowX: 'hidden',
+            borderTop: C.lineSoft,
+            padding: '2px 0 4px',
+          },
+        }, rows.map((row, index) => h(LiveRequestRow, { key: index, row, now }))))
+      }
+
+      return h(
+        'div',
+        {
+          style: {
+            position: 'fixed',
+            left: pos.left,
+            top: pos.top,
+            width: liveWidth(open),
+            maxWidth: 'calc(100vw - 36px)',
+            boxSizing: 'border-box',
+            display: 'flex',
+            flexDirection: 'column',
+            maxHeight: 'calc(100vh - 16px)',
+            overflow: 'hidden',
+            borderRadius: 12,
+            border: '1px solid ' + C.borderL1,
+            background: C.overlay,
+            boxShadow: '0 10px 28px rgba(0,0,0,.30)',
+            color: C.label,
+            fontFamily: MONO,
+            fontSize: 12,
+            lineHeight: '18px',
+            userSelect: 'none',
+          },
+        },
+        open === true ? [bar, ...body] : [bar],
+      )
+    }
+
+    //#endregion
+
     /** Find the locale service on the context, whichever shape it has. */
     function resolveLocale(ctx) {
       try {
@@ -2698,6 +3303,13 @@ window.__ModuleLoader__.load({
         ctx.slots.inject('main', () => ctx.slots.register(
           { name: 'main', key: 'multi-key-orchestrator', locale: NS },
           PanelPage,
+        ))
+
+        // The floating live monitor, pinned over the shell and draggable from
+        // its own top bar.
+        ctx.slots.inject('shell.overlay', () => ctx.slots.register(
+          { name: 'shell.overlay', id: 'multi-key-orchestrator-live', order: 60, locale: NS },
+          LiveMonitor,
         ))
       },
     }

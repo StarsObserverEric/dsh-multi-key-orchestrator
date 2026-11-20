@@ -1,8 +1,8 @@
 {
   "name": "@stars_observer_eric/dsh-multi-key-orchestrator",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "type": "module",
-  "description": "Spread one conversation's requests across several API keys of the same provider, cap concurrency per provider / model / key with a slot reserved for the main process, recover from HTTP 429 by rotating keys, and show each key's remaining balance.",
+  "description": "Spread one conversation's requests across several API keys of the same provider, cap concurrency per provider / model / key with a slot reserved for the main process, park a key the moment its balance is gone (and bring it back when it returns), and show every in-flight request of every conversation and subagent in a draggable live window.",
   "license": "MIT",
   "icon": "./icon.svg",
   "author": {
@@ -25,11 +25,14 @@
     "key-pool",
     "load-balancing",
     "rate-limit",
-    "concurrency"
+    "concurrency",
+    "live-monitor",
+    "health-check",
+    "quota"
   ],
   "meta": {
     "title": "Multi-Key Orchestrator",
-    "description": "Give one provider several API keys. Requests are spread across them by a lease, per-provider / per-model / per-key caps keep the total under control while one slot stays free for the main process, a 429 parks only the offending key and rotates to a healthy one, and every key carries a live balance card read from the provider's own quota endpoint."
+    "description": "Give one provider several API keys. Requests are spread across them by a lease, per-provider / per-model / per-key caps keep the total under control while one slot stays free for the main process, a key whose balance is gone leaves the rotation on its own (its slots removed from the total, the surplus queued) and comes back when the balance does, two entries holding the same secret are counted as one key, every key can be health-checked for a single token, and a draggable live window lists every request currently in flight across all conversations and subagents."
   },
   "exports": {
     ".": "./host.js",
@@ -48,6 +51,7 @@
     "locale/en.json",
     "locale/zh.json",
     "icon.svg",
+    "CHANGELOG.md",
     "README.md",
     "README.en.md",
     "LICENSE",

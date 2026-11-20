@@ -332,8 +332,81 @@ const STATUS = {
   log: [],
 }
 
+/**
+ * The live half: two pools, the third key of `ecnu-max` exhausted, and three
+ * requests in flight — a main-conversation request that has not been leased a
+ * key yet, and two subagent requests that have.
+ */
+const LIVE_POOLS = [
+  {
+    provider: 'ecnu',
+    model: 'ecnu-max',
+    maxConcurrent: 9,
+    keys: [
+      { id: 'k3', note: 'ZSQ', state: 'healthy', activeLeases: 1, maxConcurrent: 3, cooldownUntil: null },
+      { id: 'k4', note: 'LB', state: 'healthy', activeLeases: 1, maxConcurrent: 3, cooldownUntil: null },
+      { id: 'k1', note: 'default', state: 'quota_exhausted', activeLeases: 0, maxConcurrent: 3, cooldownUntil: null },
+    ],
+  },
+  {
+    provider: 'ecnu',
+    model: 'ecnu-plus',
+    maxConcurrent: 6,
+    keys: [
+      { id: 'k3', note: 'ZSQ', state: 'healthy', activeLeases: 1, maxConcurrent: 3, cooldownUntil: null },
+      { id: 'k1', note: 'default', state: 'healthy', activeLeases: 0, maxConcurrent: 3, cooldownUntil: null },
+    ],
+  },
+]
+
+const LIVE_STATUS = {
+  ...STATUS,
+  ui: { showLive: true },
+  pools: LIVE_POOLS,
+  live: {
+    active: [
+      {
+        id: 41,
+        title: 'review the quota contract',
+        agent: '',
+        lane: 'pending',
+        provider: 'ecnu',
+        model: 'ecnu-plus',
+        keyId: null,
+        keyLabel: null,
+        state: 'entering',
+        at: Date.now() - 3_000,
+      },
+      {
+        id: 42,
+        title: 'refactor the allocator',
+        agent: 'quota-checker',
+        lane: 'child',
+        provider: 'ecnu',
+        model: 'ecnu-max',
+        keyId: 'k3',
+        keyLabel: 'ZSQ',
+        state: 'leased',
+        at: Date.now() - 12_000,
+      },
+      {
+        id: 43,
+        title: 'refactor the allocator',
+        agent: 'diff-reviewer',
+        lane: 'child',
+        provider: 'ecnu',
+        model: 'ecnu-max',
+        keyId: 'k4',
+        keyLabel: 'LB',
+        state: 'leased',
+        at: Date.now() - 8_000,
+      },
+    ],
+  },
+}
+
 /** Install a fetch stub that answers status and records every mutation. */
-function stubFetch() {
+function stubFetch(status = STATUS) {
   const calls = []
   globalThis.fetch = async (url, init) => {
     const call = { url: String(url), body: init?.body ? JSON.parse(String(init.body)) : undefined }
@@ -341,7 +414,7 @@ function stubFetch() {
     if (call.url.includes('/config')) {
       return { ok: true, status: 200, json: async () => ({ ok: true, savedAt: Date.now() }) }
     }
-    return { ok: true, status: 200, json: async () => ({ ok: true, status: STATUS }) }
+    return { ok: true, status: 200, json: async () => ({ ok: true, status }) }
   }
   return calls
 }
@@ -416,6 +489,7 @@ function applyClient() {
 
 const NAV = 'sidebar.panellist::multi-key-orchestrator'
 const PAGE = 'main::multi-key-orchestrator'
+const OVERLAY = 'shell.overlay::multi-key-orchestrator-live'
 
 /** Open every provider section by pressing page controls until a model appears. */
 async function expandPage() {
@@ -430,17 +504,19 @@ async function expandPage() {
   return view
 }
 
-test('the module registers only the navigation entry and the page', () => {
+test('the module registers the navigation entry, the page and the live overlay', () => {
   assert.ok(captured, 'client.js did not call window.__ModuleLoader__.load')
   assert.equal(captured.id, '@stars_observer_eric/dsh-multi-key-orchestrator')
   const { module } = applyClient()
   assert.deepEqual(module.inject, ['slots', 'locale'])
   assert.equal(registrations.get(NAV)?.options.order, 21, 'the entry sits under Context Insights (order 20)')
   assert.equal(registrations.get(PAGE)?.options.key, 'multi-key-orchestrator')
-  assert.equal(registrations.size, 2, `unexpected extra seats: ${[...registrations.keys()].join(', ')}`)
+  assert.equal(registrations.get(OVERLAY)?.options.id, 'multi-key-orchestrator-live')
+  assert.equal(registrations.get(OVERLAY)?.options.order, 60, 'the monitor floats above the shell')
+  assert.equal(registrations.size, 3, `unexpected extra seats: ${[...registrations.keys()].join(', ')}`)
   const source = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8')
   assert.ok(!source.includes('sidebar.footer.action'), 'the footer pill must be gone')
-  assert.ok(!source.includes('shell.overlay'), 'the floating panel must be gone')
+  assert.ok(!/backdrop-filter|color-mix/.test(source), 'the glass belongs to the wallpaper plugin, not to this file')
 })
 
 test('the navigation entry is named Multi-Key Orchestrator and draws only a glyph', async () => {
@@ -569,4 +645,91 @@ test('the page is its own scroll container so the panel cannot clip', () => {
   for (const pattern of [/overflowY\s*:\s*'auto'/, /minHeight\s*:\s*0/, /boxSizing\s*:\s*'border-box'/, /height\s*:\s*'100%'/]) {
     assert.ok(pattern.test(source), `the page root is missing ${pattern}`)
   }
+})
+
+// ------------------------------------------------------------- live monitor
+
+test('the live overlay names the conversation, the subagent and the key', async () => {
+  applyClient()
+  stubFetch(LIVE_STATUS)
+  const view = await renderSeat(OVERLAY, {})
+  assert.match(view.text, /Live requests/, 'the bar carries the title from the dictionary')
+  assert.match(view.text, /3 in flight/, 'the bar counts what is in flight')
+  assert.match(view.text, /refactor the allocator › quota-checker/, 'the subagent label must follow the title')
+  assert.match(view.text, /refactor the allocator › diff-reviewer/)
+  assert.match(view.text, /review the quota contract/)
+  assert.doesNotMatch(
+    view.text,
+    /review the quota contract ›/,
+    'a main-conversation request has no subagent label to print',
+  )
+  assert.match(view.text, /ZSQ/, 'the operator note of the serving key is the column')
+  assert.match(view.text, /LB/)
+  assert.match(view.text, /…/, 'a request that is still entering has no lane yet')
+  assert.match(view.text, /12s|\d+s/, 'each row counts the seconds it has been waiting')
+})
+
+test('the overlay disappears when the operator hides it, but keeps polling', async () => {
+  applyClient()
+  const calls = stubFetch({ ...LIVE_STATUS, ui: { showLive: false } })
+  const view = await renderSeat(OVERLAY, {})
+  assert.equal(view.text, '', 'a hidden overlay must render nothing at all')
+  assert.equal(registrations.has(OVERLAY), true, 'hiding must not unregister the seat')
+  const polls = calls.filter((call) => call.url.includes('/status'))
+  assert.ok(polls.length > 0, 'the poll must continue while hidden, so the switch can bring it back')
+})
+
+test('a busy pool lists every key of the pool, exhausted ones marked', async () => {
+  applyClient()
+  stubFetch(LIVE_STATUS)
+  const view = await renderSeat(OVERLAY, {})
+  assert.match(view.text, /ecnu-max/)
+  assert.match(view.text, /2\/9/, 'the model line counts in flight against the pool total')
+  assert.match(view.text, /ecnu-plus/)
+  assert.match(view.text, /1\/6/)
+  assert.match(view.text, /ZSQ:1\/3/, 'a key is shown as note:active/max')
+  assert.match(view.text, /LB:1\/3/)
+  assert.match(view.text, /default:0\/3⛔/, 'an exhausted key is listed and marked, never hidden')
+  assert.equal((view.text.match(/⛔/g) ?? []).length, 1, 'only the exhausted key carries the marker')
+})
+
+test('every key row offers a test-connection button between enable and remove', async () => {
+  applyClient()
+  const calls = stubFetch()
+  const opened = await expandPage()
+  assert.match(opened.text, /Test connection/, 'the label must come from t(key.test)')
+  const enabledAt = opened.text.indexOf('Enabled')
+  const testAt = opened.text.indexOf('Test connection')
+  assert.ok(enabledAt >= 0 && testAt > enabledAt, 'the test button follows the enabled box')
+  assert.ok(
+    (opened.text.match(/Test connection/g) ?? []).length >= 3,
+    'one button per configured key, on every provider',
+  )
+
+  // The remove button only draws its label through a `children` prop, which
+  // this text renderer does not resolve — the order is asserted in the source.
+  const source = fs.readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  const row = source.slice(source.indexOf('function ProviderKeyRow'), source.indexOf('function AddProviderKeyForm'))
+  const enabledKey = row.indexOf("key: 'enabled'")
+  const testKey = row.indexOf("key: 'test'")
+  const removeKey = row.indexOf("key: 'remove'")
+  assert.ok(enabledKey >= 0 && testKey > enabledKey, 'the test button must sit after the enabled box')
+  assert.ok(removeKey > testKey, 'the test button must sit before removal')
+
+  // Press page controls until one posts the new op; that proves the wiring, not
+  // just the label. `test-key` carries the provider and the key id.
+  let posted = undefined
+  for (const handler of opened.handlers) {
+    handler(inertEvent)
+    await microtask()
+    await microtask()
+    posted = calls
+      .filter((call) => call.url.includes('/config'))
+      .map((call) => call.body)
+      .find((body) => body?.op === 'test-key')
+    if (posted !== undefined) break
+  }
+  assert.ok(posted, 'no control posted the test-key op')
+  assert.equal(posted.provider, 'ecnu')
+  assert.ok(posted.keyId !== undefined && posted.keyId !== null, 'the op must name the key it tests')
 })

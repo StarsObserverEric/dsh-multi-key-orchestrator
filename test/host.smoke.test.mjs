@@ -224,6 +224,18 @@ const MID_STREAM_429 = [
   { type: 'text-delta', index: 0, text: 'partial answer' },
   { type: 'finish', reason: { kind: 'error', failure: { code: 'RATE_LIMIT', status: 429, message: 'rate limit exceeded', providerRetryAfterMs: 20_000 } } },
 ]
+
+/** A 429 whose wording the classifier cannot place: the field case that used to
+ *  be re-thrown instead of rotated, because the adapter sent no status field. */
+const UNKNOWN_429 = [
+  {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: { code: 'RATE_LIMIT', message: '429 {"detail":"请求过于频繁，超过应用的每168小时 credits 限制"}' },
+    },
+  },
+]
 const BAD_KEY = [
   { type: 'finish', reason: { kind: 'error', failure: { code: 'AUTH', status: 401, message: 'invalid api key' } } },
 ]
@@ -308,7 +320,7 @@ test('two keys create a pool whose cap is derived from the key count', async () 
       assert.equal(key.maskedLabel, '••••••', 'the mask is constant: no key characters are ever rendered')
       assert.equal(key.ref, undefined, 'the credential ref is not part of the wire shape')
       assert.ok(typeof key.note === 'string' && key.note.length > 0, 'each key carries a note')
-      assert.equal(key.maxConcurrent, 0, 'a per-key cap defaults to inheriting the pool cap')
+      assert.equal(key.maxConcurrent, 3, 'an unset per-key cap defaults to three, never to unlimited')
     }
     assert.ok(!JSON.stringify(status.body).includes('sk-secret-value-1'), 'no secret may appear in status')
     const stateFile = path.join(harness.stateDir, 'state.json')
@@ -660,7 +672,7 @@ test('a provider key keeps a note and a per-model concurrency cap', async () => 
     const pool = status.body.status.pools.find((row) => row.model === 'ecnu-max')
     assert.equal(pool.keys[0].maxConcurrent, 2, 'the cap belongs to this model')
     const plus = status.body.status.pools.find((row) => row.model === 'ecnu-plus')
-    assert.equal(plus?.keys[0]?.maxConcurrent ?? 0, 0, 'a different model keeps its own cap')
+    assert.equal(plus?.keys[0]?.maxConcurrent ?? 0, 3, 'a different model keeps its own default cap')
   } finally {
     harness.dispose()
   }
@@ -1184,6 +1196,122 @@ test('an unknown config op is refused rather than silently accepted', async () =
     const response = await harness.call('config', 'POST', { op: 'make-me-a-sandwich' })
     assert.equal(response.body.ok, false)
     assert.match(String(response.body.error), /unknown|unsupported|op/i)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('an unrecognised failure still parks a key whose balance is gone', async () => {
+  const harness = await boot({ mode: 'active' })
+  try {
+    await addKeys(harness, 2)
+    const keys = (await harness.call('status', 'GET')).body.status.pools[0].keys
+    for (const key of keys) {
+      await harness.call('config', 'POST', {
+        op: 'set-key-cap', provider: 'ecnu', model: 'ecnu-max', keyId: key.id, maxConcurrent: 3,
+      })
+    }
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+
+    const listeners = harness.listener('llm/stream')
+    // Warm the balance cache while both keys are healthy.
+    await collect(listeners(OPTIONS, stream(SUCCESS)))
+
+    // One key now fails with wording the classifier cannot place, and its balance
+    // probe answers "nothing left": it must leave the rotation for real rather
+    // than being cooled for two seconds and handed the next request.
+    biller.remaining = 0
+    let calls = 0
+    const next = () => {
+      calls += 1
+      return stream(calls === 1 ? UNKNOWN_429 : SUCCESS)()
+    }
+    const chunks = await collect(listeners(OPTIONS, next))
+    assert.equal(calls, 2, 'the failing key was skipped')
+    assert.deepEqual(chunks, SUCCESS, 'the request still completed on a healthy key')
+
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    const after = (await harness.call('status', 'GET')).body.status.pools[0]
+    const parked = after.keys.filter((key) => key.state === 'quota_exhausted')
+    assert.equal(parked.length, 1, 'the empty key is out of rotation')
+    assert.ok(after.maxConcurrent < 6, 'and its slots left the pool total')
+  } finally {
+    biller.remaining = 900
+    harness.dispose()
+  }
+})
+
+test('the overlay switch is on by default and survives a reload', async () => {
+  const harness = await boot()
+  try {
+    const first = await harness.call('status', 'GET')
+    assert.equal(first.body.status.ui.showLive, true, 'shown unless the operator says otherwise')
+
+    const off = await harness.call('config', 'POST', { op: 'set-live-visibility', show: false })
+    assert.equal(off.body.ok, true, JSON.stringify(off.body))
+    assert.equal(off.body.status.ui.showLive, false)
+
+    // The preference is state, not a tab-local flag: read it back from disk.
+    const saved = JSON.parse(fs.readFileSync(path.join(harness.stateDir, 'state.json'), 'utf8'))
+    assert.equal(saved.ui.showLive, false)
+
+    const on = await harness.call('config', 'POST', { op: 'set-live-visibility', show: true })
+    assert.equal(on.body.status.ui.showLive, true)
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('the connection test asks for exactly one token and reports the round trip', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 1)
+    const keyId = (await harness.call('status', 'GET')).body.status.providers[0].keys[0].id
+
+    const calls = []
+    const original = globalThis.fetch
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : undefined })
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ choices: [{ message: { content: '1' } }], usage: { completion_tokens: 1 } }),
+      }
+    }
+    try {
+      const result = await harness.call('config', 'POST', { op: 'test-key', provider: 'ecnu', keyId })
+      assert.equal(result.body.ok, true, JSON.stringify(result.body))
+      assert.equal(result.body.result.connected, true)
+      assert.equal(calls.length, 1, 'exactly one request')
+      const sent = calls[0].body
+      assert.equal(sent.max_tokens, 1, 'one token of output')
+      assert.equal(sent.messages.length, 1)
+      assert.equal(sent.messages[0].content, '1', 'one character of input')
+      assert.equal(sent.stream, false, 'no stream to parse')
+    } finally {
+      globalThis.fetch = original
+    }
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('the connection test reports a dead key instead of throwing', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 1)
+    const keyId = (await harness.call('status', 'GET')).body.status.providers[0].keys[0].id
+    const original = globalThis.fetch
+    globalThis.fetch = async () => ({ ok: false, status: 401, text: async () => 'invalid api key' })
+    try {
+      const result = await harness.call('config', 'POST', { op: 'test-key', provider: 'ecnu', keyId })
+      assert.equal(result.body.ok, true, 'the op itself succeeded')
+      assert.equal(result.body.result.connected, false)
+      assert.equal(result.body.result.status, 401)
+      assert.match(String(result.body.result.detail), /invalid api key/)
+    } finally {
+      globalThis.fetch = original
+    }
   } finally {
     harness.dispose()
   }
