@@ -51,7 +51,9 @@ const DEFAULT_QUOTA_PATTERNS = Object.freeze([
   'insufficient quota',
   'quota',
   'billing',
-  'budget',
+  'budget exceeded',
+  'out of budget',
+  'credit budget',
   'credit balance',
   'out of credits',
   'credits exhausted',
@@ -64,6 +66,28 @@ const DEFAULT_QUOTA_PATTERNS = Object.freeze([
   '限制',
   '频繁',
   '超过',
+])
+
+/**
+ * Failures that belong to the *request*, not to the key.
+ *
+ * The request carries too many images, or more context than the route accepts.
+ * Another plugin repairs the surface and asks the loop to retry — DSH ships an
+ * image-offload handler and a compaction handler for exactly this. Rotating to
+ * another key sends the identical request and fails identically, so these must
+ * be handed downstream untouched: no cooldown, no rotation, no retry budget.
+ */
+const DELEGATED_PATTERNS = Object.freeze([
+  'image budget',
+  'IMAGE_OFFLOAD',
+  'image_offload',
+  'offload',
+  'context window',
+  'context_window',
+  'context length',
+  'context_length',
+  'maximum context',
+  'too many tokens',
 ])
 
 /** Phrases that keep a 429 in the retryable class. */
@@ -156,6 +180,11 @@ export function maskSecret(secret) {
  * @returns {{ kind: string, retryAfterMs?: number, reason: string }}
  */
 export function classifyFailure(failure, patterns = {}) {
+  // Repair-able by another plugin: hand it back before any key-level reasoning.
+  const delegatedHaystack = `${failure?.code ?? ''} ${failure?.message ?? ''}`
+  if (DELEGATED_PATTERNS.some((needle) => delegatedHaystack.toLowerCase().includes(needle.toLowerCase()))) {
+    return { kind: FAILURE_KIND.structural, reason: 'handled-elsewhere' }
+  }
   // Adapters sometimes hand over only a message ("429 {...}") with no status
   // field. Treating that as status-less left a plain 429 classified as "other",
   // which re-threw the failure instead of rotating away from a dead key.

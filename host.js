@@ -1527,9 +1527,12 @@ export function apply(ctx) {
           lane,
           detail: `${failure.code}${failure.status ? ` ${failure.status}` : ''} ${String(failure.message ?? '').slice(0, 160)}`,
         })
-        // Nothing another key could fix (bad request, auth, unknown transport
-        // failure): hand it up exactly as the adapter raised it, so the error a
-        // user sees is the provider's own.
+        // Nothing another key could fix (bad request, auth, an oversized
+        // request another plugin repairs): hand it up exactly as the adapter
+        // raised it, so the error a user sees is the provider's own and the
+        // plugin that can actually fix it gets the agent/request-error pass.
+        pendingRetries.delete(options?.sessionId ?? sessionKey)
+        retryRounds.delete(options?.sessionId ?? sessionKey)
         if (thrown !== undefined) throw thrown
         return
       }

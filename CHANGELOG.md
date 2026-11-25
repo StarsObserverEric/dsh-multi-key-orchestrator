@@ -1,5 +1,30 @@
 # 更新日志
 
+## 0.5.2 — 2026-11-25
+
+修掉 0.5.1 引入的一个新错误：把**该由别的插件修**的失败当成"换 Key 就能解决"，结果把可恢复的失败变成假报"池子耗尽"。
+
+### 问题现场
+
+会话日志（09:28–09:30）：
+
+```
+MULTI_KEY_RETRY  Rotated away from •••••• (pi-ai request images exceed the route image budget; 1 more oldest occurrence(s) must be offloaded.)
+→ 9 次后 → MULTI_KEY_POOL_EXHAUSTED  Gave up after 9 attempts on ecnu/ecnu-max
+```
+
+这是"**请求里图片太多**"，DSH 有专门的插件（`dsh-compaction-image-offload`，随 `dsh-base` 挂载）来处理：它把最老的若干张图片标记为已卸载，然后让循环重试。换一把 Key 发同一份请求，必然还是超限——所以轮换 9 次全部失败，最后我把它报成"所有 Key 都耗尽"，既误导又掩盖了真正的原因。
+
+### 两处根因
+
+1. **额度关键词太宽**：`budget` 这个裸词命中了 `route image budget`，于是被当成钱包问题。现在只认 `budget exceeded` / `out of budget` / `credit budget`。
+2. **没有"这不归我管"的分支**：凡是 `IMAGE_OFFLOAD` / `image budget` / `context window` / `context length` / `maximum context` / `too many tokens` 这一类**请求本身**的问题，一律委派下游（返回给 `agent/request-error` 瀑布的后续监听器），做到：不冷却、不换 Key、不消耗重试预算、**原样保留** `failure.offloadImages` 计数（别的插件要靠它决定卸载几张）。
+
+### 顺带
+
+- 走委派分支时会清掉本会话残留的 `pendingRetries` / `retryRounds`，避免一次陈旧登记抢走下一次 `agent/request-error` 的处理权。
+- 测试 101 → 103：新增"超大请求必须委派、不得轮换"（引擎级 + 端到端），并明确"真·预算耗尽仍然是 quota"。
+
 ## 0.5.1 — 2026-11-25
 
 修掉两个会让整轮对话直接死掉的缺陷。这两个都不是"偶发"，是有明确成因的确定性错误。

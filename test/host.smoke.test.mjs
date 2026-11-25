@@ -236,6 +236,20 @@ const UNKNOWN_429 = [
     },
   },
 ]
+
+/** The image budget refusal that another plugin repairs by offloading images. */
+const IMAGE_BUDGET = [
+  {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: {
+        code: 'IMAGE_OFFLOAD_REQUIRED',
+        message: 'pi-ai request images exceed the route image budget; 1 more oldest occurrence(s) must be offloaded.',
+      },
+    },
+  },
+]
 const BAD_KEY = [
   { type: 'finish', reason: { kind: 'error', failure: { code: 'AUTH', status: 401, message: 'invalid api key' } } },
 ]
@@ -1319,6 +1333,37 @@ test('the connection test reports a dead key instead of throwing', async () => {
     } finally {
       globalThis.fetch = original
     }
+  } finally {
+    harness.dispose()
+  }
+})
+
+test('an image-budget refusal is surfaced once, without rotating or cooling', async () => {
+  const harness = await boot()
+  try {
+    await addKeys(harness, 2)
+    await harness.call('config', 'POST', { op: 'toggle', enabled: true })
+    const streamListener = harness.listener('llm/stream')
+    let calls = 0
+    const next = () => {
+      calls += 1
+      if (calls > 1) throw new Error('next() called multiple times')
+      return stream(IMAGE_BUDGET)()
+    }
+    const chunks = await collect(streamListener(OPTIONS, next))
+    assert.equal(calls, 1, 'the request is not resent to another key')
+    const finish = chunks.at(-1)
+    assert.equal(finish.reason.failure.code, 'IMAGE_OFFLOAD_REQUIRED', 'the original failure reaches the loop untouched')
+
+    const status = await harness.call('status', 'GET')
+    assert.ok(
+      status.body.status.pools[0].keys.every((key) => key.state !== 'cooldown'),
+      'no key was blamed for an oversized request',
+    )
+    assert.ok(
+      !status.body.status.log.some((entry) => entry.action === 'retry'),
+      'and no rotation was requested',
+    )
   } finally {
     harness.dispose()
   }

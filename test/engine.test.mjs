@@ -458,3 +458,22 @@ test('a provider ceiling never narrows admission below the operator total', () =
   orchestrator.setMaxConcurrent(6)
   assert.equal(orchestrator.softTotal, 5, 'and only narrows when it is enforced')
 })
+
+test('an oversized request is delegated, never rotated', () => {
+  // The exact failure that turned a repairable image budget into "pool
+  // exhausted": the wording mentions a budget, another plugin offloads the
+  // images, and rotating keys can never help because the request is identical.
+  const imageBudget = classifyFailure({
+    code: 'IMAGE_OFFLOAD_REQUIRED',
+    message: 'pi-ai request images exceed the route image budget; 1 more oldest occurrence(s) must be offloaded.',
+  })
+  assert.equal(imageBudget.kind, 'structural', 'not a key problem')
+  assert.equal(imageBudget.reason, 'handled-elsewhere')
+
+  const contextWindow = classifyFailure({ code: 'PROVIDER', message: 'maximum context length is 131072 tokens' })
+  assert.equal(contextWindow.kind, 'structural')
+
+  // A real money problem still classifies as quota.
+  const money = classifyFailure({ code: 'PROVIDER', message: 'out of budget on this account' })
+  assert.equal(money.kind, 'quota')
+})
