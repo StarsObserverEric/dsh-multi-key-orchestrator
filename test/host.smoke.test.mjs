@@ -372,7 +372,7 @@ test('a pooled request swaps the auth header to the leased key secret', async ()
   }
 })
 
-test('a pre-content 429 rotates to the other key and the consumer sees one clean answer', async () => {
+test('a pre-content 429 never calls next twice and asks the loop for a retry', async () => {
   const harness = await boot()
   try {
     await addKeys(harness, 2)
@@ -381,17 +381,33 @@ test('a pre-content 429 rotates to the other key and the consumer sees one clean
     let calls = 0
     const next = () => {
       calls += 1
-      return stream(calls === 1 ? RATE_LIMIT : SUCCESS)()
+      if (calls > 1) throw new Error('next() called multiple times')
+      return stream(RATE_LIMIT)()
     }
     const chunks = await collect(streamListener(OPTIONS, next))
-    assert.equal(calls, 2, 'the failing attempt was retried on a different key')
-    assert.equal(chunks.filter((chunk) => chunk.type === 'finish').length, 1, 'exactly one finish reaches the consumer')
-    assert.deepEqual(chunks, SUCCESS, 'the failed attempt emitted nothing')
+    assert.equal(calls, 1, 'exactly one next() per dispatch — calling it twice kills the turn')
+    const finish = chunks.at(-1)
+    assert.equal(finish.type, 'finish')
+    assert.equal(finish.reason.kind, 'error')
+    assert.equal(finish.reason.failure.code, 'MULTI_KEY_RETRY', 'the loop is asked to re-run on another key')
+
     const status = await harness.call('status', 'GET')
     const cooling = status.body.status.pools[0].keys.find((key) => key.state === 'cooldown')
     assert.ok(cooling, 'the offending key is cooling')
-    assert.ok(cooling.cooldownUntil - Date.now() <= 15_000, 'cooldown came from Retry-After, not a fixed hour')
-    assert.ok(status.body.status.log.some((entry) => entry.action === 'cooldown'))
+
+    // The retry request is honoured by the request-error listener, without it
+    // ever calling its own next().
+    const errorListener = harness.listener('agent/request-error')
+    let downstreamCalled = false
+    const action = await errorListener(
+      { agent: { id: OPTIONS.sessionId }, provider: 'ecnu', failure: finish.reason.failure },
+      async () => {
+        downstreamCalled = true
+        return undefined
+      },
+    )
+    assert.deepEqual(action, { kind: 'retry' }, 'a retryable rotation is converted into a retry action')
+    assert.equal(downstreamCalled, false, 'a handling listener vetoes the downstream default')
   } finally {
     harness.dispose()
   }
@@ -474,14 +490,14 @@ test('a mid-stream 429 is not retried once the retry budget is spent', async () 
     const requestError = harness.listener('agent/request-error')
     await collect(streamListener(OPTIONS, stream(MID_STREAM_429)))
     let delegated = false
-    const action = requestError(
+    const action = await requestError(
       { agent: { id: 'root-session' }, provider: 'ecnu', failure: {} },
       () => {
         delegated = true
         return undefined
       },
     )
-    assert.equal(delegated, true)
+    assert.equal(delegated, true, 'a spent budget leaves the decision downstream')
     assert.equal(action, undefined)
   } finally {
     harness.dispose()
@@ -863,7 +879,7 @@ test('concurrent traffic spreads evenly and never exceeds either cap', async () 
   }
 })
 
-test('a 429 thrown by the adapter is cooled and rotated like a yielded one', async () => {
+test('a 429 thrown by the adapter is cooled and asks the loop to rotate', async () => {
   const harness = await boot()
   try {
     await addKeys(harness, 2)
@@ -872,19 +888,16 @@ test('a 429 thrown by the adapter is cooled and rotated like a yielded one', asy
     let calls = 0
     const next = () => {
       calls += 1
-      if (calls === 1) {
-        // A transport-level failure: the adapter raises instead of yielding a
-        // finish chunk. Before the pool caught it, this escaped untouched and
-        // the key was neither cooled nor rotated.
-        return (async function* boom() {
-          throw Object.assign(new Error('429 model_concurrency_exceeded: max_concurrency 5, active 5'), { status: 429 })
-        })()
-      }
-      return stream(SUCCESS)()
+      if (calls > 1) throw new Error('next() called multiple times')
+      // A transport-level failure: the adapter raises instead of yielding a
+      // finish chunk.
+      return (async function* boom() {
+        throw Object.assign(new Error('429 model_concurrency_exceeded: max_concurrency 5, active 5'), { status: 429 })
+      })()
     }
     const chunks = await collect(streamListener(OPTIONS, next))
-    assert.equal(calls, 2, 'the throwing attempt was retried on another key')
-    assert.deepEqual(chunks, SUCCESS, 'the consumer sees one clean answer')
+    assert.equal(calls, 1, 'one next() per dispatch')
+    assert.equal(chunks.at(-1).reason.failure.code, 'MULTI_KEY_RETRY')
     const status = await harness.call('status', 'GET')
     assert.equal(status.body.status.log.filter((entry) => entry.action === 'cooldown').length, 1)
     assert.equal(status.body.status.pools[0].keys.filter((key) => key.state === 'cooldown').length, 1)
@@ -902,16 +915,14 @@ test('a thrown 429 is recognised from the message when no status is attached', a
     let calls = 0
     const next = () => {
       calls += 1
-      if (calls === 1) {
-        return (async function* boom() {
-          throw new Error('HTTP 429: model_concurrency_exceeded')
-        })()
-      }
-      return stream(SUCCESS)()
+      if (calls > 1) throw new Error('next() called multiple times')
+      return (async function* boom() {
+        throw new Error('HTTP 429: model_concurrency_exceeded')
+      })()
     }
     const chunks = await collect(streamListener(OPTIONS, next))
-    assert.equal(calls, 2)
-    assert.deepEqual(chunks, SUCCESS)
+    assert.equal(calls, 1)
+    assert.equal(chunks.at(-1).reason.failure.code, 'MULTI_KEY_RETRY', 'the status was recovered from the message')
   } finally {
     harness.dispose()
   }
@@ -1053,7 +1064,7 @@ test('a trusted remote authority does not need a loopback socket', async () => {
   }
 })
 
-test('an adapter that throws synchronously is cooled and rotated too', async () => {
+test('an adapter that throws synchronously is cooled and asks the loop to rotate', async () => {
   const harness = await boot()
   try {
     await addKeys(harness, 2)
@@ -1062,16 +1073,12 @@ test('an adapter that throws synchronously is cooled and rotated too', async () 
     let calls = 0
     const next = () => {
       calls += 1
-      if (calls === 1) {
-        // Refuses before returning any iterable: the synchronous twin of the
-        // async throw covered above.
-        throw Object.assign(new Error('429 concurrency_exceeded'), { status: 429 })
-      }
-      return stream(SUCCESS)()
+      if (calls > 1) throw new Error('next() called multiple times')
+      throw Object.assign(new Error('429 concurrency_exceeded'), { status: 429 })
     }
     const chunks = await collect(streamListener(OPTIONS, next))
-    assert.equal(calls, 2, 'the synchronous failure was retried on another key')
-    assert.deepEqual(chunks, SUCCESS)
+    assert.equal(calls, 1, 'the synchronous failure did not produce a second next()')
+    assert.equal(chunks.at(-1).reason.failure.code, 'MULTI_KEY_RETRY')
     const status = await harness.call('status', 'GET')
     assert.equal(status.body.status.log.filter((entry) => entry.action === 'cooldown').length, 1)
   } finally {
@@ -1217,20 +1224,20 @@ test('an unrecognised failure still parks a key whose balance is gone', async ()
     // Warm the balance cache while both keys are healthy.
     await collect(listeners(OPTIONS, stream(SUCCESS)))
 
-    // One key now fails with wording the classifier cannot place, and its balance
-    // probe answers "nothing left": it must leave the rotation for real rather
-    // than being cooled for two seconds and handed the next request.
+    // The key now fails with wording the classifier cannot place, and its own
+    // balance endpoint answers "nothing left": the key must leave the rotation.
     biller.remaining = 0
     let calls = 0
     const next = () => {
       calls += 1
-      return stream(calls === 1 ? UNKNOWN_429 : SUCCESS)()
+      if (calls > 1) throw new Error('next() called multiple times')
+      return stream(UNKNOWN_429)()
     }
     const chunks = await collect(listeners(OPTIONS, next))
-    assert.equal(calls, 2, 'the failing key was skipped')
-    assert.deepEqual(chunks, SUCCESS, 'the request still completed on a healthy key')
+    assert.equal(calls, 1)
+    assert.equal(chunks.at(-1).reason.failure.code, 'MULTI_KEY_RETRY')
 
-    await new Promise((resolve) => setTimeout(resolve, 120))
+    await new Promise((resolve) => setTimeout(resolve, 150))
     const after = (await harness.call('status', 'GET')).body.status.pools[0]
     const parked = after.keys.filter((key) => key.state === 'quota_exhausted')
     assert.equal(parked.length, 1, 'the empty key is out of rotation')

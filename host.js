@@ -337,6 +337,8 @@ export function apply(ctx) {
   const warnings = new Map()
   const correlation = new Map()
   const pendingRetries = new Map()
+  /** Retry rounds already spent per session; cleared by a successful request. */
+  const retryRounds = new Map()
   const observedBaseURL = new Map()
   const resolvedBaseURL = new Map()
   const als = new AsyncLocalStorage()
@@ -1045,9 +1047,35 @@ export function apply(ctx) {
         ),
       )
     }
-    const parked = parkedKeyIds(poolState)
+    let parked = parkedKeyIds(poolState)
+    let eligible = definitions.filter((definition) => !quota.isExhausted(definition.id) && !parked.has(definition.id))
+
+    // Self-heal: a pool where *every* key is parked, while their own balances
+    // read healthy, is a stale verdict rather than a real outage — a provider
+    // hiccup or a single bad probe must not lock the whole provider out.
+    if (eligible.length === 0) {
+      const orchestrator = pools.get(poolIdentity(poolState.provider, poolState.model))?.orchestrator
+      let revived = 0
+      for (const definition of definitions) {
+        const view = quota.view(definition.id)
+        const healthy = view && (view.state === 'ok' || view.state === 'low')
+        if (healthy && orchestrator) {
+          orchestrator.clearQuota(definition.id, 'self-heal')
+          revived += 1
+        }
+      }
+      if (revived > 0) {
+        record({
+          action: 'quota',
+          pool: `${poolState.provider}/${poolState.model}`,
+          detail: `self-heal: ${revived} key(s) had a healthy balance and were put back`,
+        })
+        parked = parkedKeyIds(poolState)
+        eligible = definitions.filter((definition) => !quota.isExhausted(definition.id) && !parked.has(definition.id))
+      }
+    }
+
     const isEligible = (keyRuntime) => !quota.isExhausted(keyRuntime.id) && !parked.has(keyRuntime.id)
-    const eligible = definitions.filter((definition) => !quota.isExhausted(definition.id) && !parked.has(definition.id))
     return {
       isEligible,
       eligibleCount: eligible.length,
@@ -1254,16 +1282,47 @@ export function apply(ctx) {
     }
   }
 
+  /**
+   * Read one key's balance right now and return the probe's state.
+   *
+   * Used as *evidence*: a key may only be taken out of rotation when its own
+   * billing endpoint says the balance is gone. Provider wording ("超过应用的
+   * 每168小时 credits 限制" is a rate limit, not an empty wallet) is not evidence.
+   * @param {any} poolState
+   * @param {string} keyId
+   * @returns {Promise<string | undefined>}
+   */
+  async function readKeyBalance(poolState, keyId) {
+    try {
+      const orchestrator = pools.get(poolIdentity(poolState.provider, poolState.model))?.orchestrator
+      const key = orchestrator?.snapshot().keys.find((candidate) => candidate.id === keyId)
+      if (!key?.ref) return undefined
+      const entry = await quota.manual(keyDefFor(poolState.provider, key))
+      return entry?.state
+    } catch {
+      return undefined
+    }
+  }
+
   /** Apply the penalty a classified failure earns its key. */
-  function applyPenalty(poolState, keyId, failure, classified) {
+  async function applyPenalty(poolState, keyId, failure, classified) {
     const orchestrator = pools.get(poolIdentity(poolState.provider, poolState.model))?.orchestrator
     if (!orchestrator) return
     if (classified.kind === 'quota') {
-      orchestrator.noteQuotaExhausted(keyId, 'http-429-quota')
-      warn(
-        'quota-exhausted',
-        `${poolState.provider}/${poolState.model} reported an exhausted balance on one key; that key is parked until its quota probe recovers.`,
-      )
+      // Evidence first. A 429 whose body mentions credits is still a 429, and
+      // parking on wording alone is how three keys with 23k credits each got
+      // reported as "quota-exhausted" at once.
+      const balance = await readKeyBalance(poolState, keyId)
+      if (balance === 'exhausted') {
+        orchestrator.noteQuotaExhausted(keyId, 'balance-empty')
+        warn(
+          'quota-exhausted',
+          `${poolState.provider}/${poolState.model}: key ${keyId} reports an empty balance; it is parked until its balance returns.`,
+        )
+        return
+      }
+      // No evidence of an empty balance: treat it as what the status code says.
+      orchestrator.noteRateLimit(keyId, cooldownFor(failure, { defaultMs: state.limits.defaultCooldownMs }))
       return
     }
     if (classified.kind === 'transient') {
@@ -1272,9 +1331,9 @@ export function apply(ctx) {
         cooldownFor(failure, { defaultMs: state.limits.defaultCooldownMs }),
       )
     }
-    // Whatever the provider said, ask its billing endpoint once: an unrecognised
-    // "no credit" wording then parks the key immediately instead of cooling it
-    // for two seconds and handing it the next request.
+    // Ask the billing endpoint once for any other failure: an unrecognised
+    // "no credit" wording then parks the key instead of cooling it for two
+    // seconds and handing it the next request.
     void probeAfterFailure(poolState, keyId)
   }
 
@@ -1366,12 +1425,16 @@ export function apply(ctx) {
     const orchestrator = entry.orchestrator
     const lane = laneOf(options?.sessionId)
     const sessionKey = `${options?.sessionId ?? '-'}|${provider}|${model}`
-    const attemptLimit = Math.max(1, Number(state.limits.maxAttempts ?? 20))
-    let attempt = 0
-
-    while (attempt < attemptLimit) {
-      attempt += 1
-
+    // ONE attempt per invocation.
+    //
+    // Cordis's waterfall hands a listener a `next` that may be called exactly
+    // once — calling it again throws "next() called multiple times" and kills
+    // the turn. Retrying therefore cannot happen here: a retryable failure is
+    // recorded in `pendingRetries` and `agent/request-error` — the sanctioned
+    // channel — asks the agent loop to re-run the step, which starts a fresh
+    // `llm/stream` dispatch and a fresh `next`.
+    const retryBudget = Math.min(8, Math.max(1, Number(state.limits.maxAttempts ?? 20)))
+    {
       const gate = await evaluateGate(poolState)
       if (gate.eligibleCount === 0) {
         stats.poolExhausted += 1
@@ -1384,13 +1447,14 @@ export function apply(ctx) {
       }
 
       const inject = state.debug?.inject429
-      if (inject === 'first' && attempt === 1) {
+      if (inject === 'first') {
+        // Debug switch: cool one key as if the provider had answered 429, then
+        // hand the request to the normal path (which will pick another key).
         const victim = gate.eligibleIds[0]
-        applyPenalty(poolState, victim, { code: 'RATE_LIMIT', status: 429, providerRetryAfterMs: 8_000 }, {
+        await applyPenalty(poolState, victim, { code: 'RATE_LIMIT', status: 429, providerRetryAfterMs: 8_000 }, {
           kind: 'transient',
         })
         record({ action: 'cooldown', pool: `${provider}/${model}`, key: victim, detail: 'injected 429 (debug)' })
-        continue
       }
 
       let lease
@@ -1442,13 +1506,15 @@ export function apply(ctx) {
 
       if (result.kind === 'success') {
         orchestrator.noteSuccess(lease.keyId)
+        pendingRetries.delete(options?.sessionId ?? sessionKey)
+        retryRounds.delete(options?.sessionId ?? sessionKey)
         return
       }
 
       const { failure, classified, aborted, contentStarted, emittedChars, thrown } = result
       const actionable = !aborted && (classified.kind === 'transient' || classified.kind === 'quota')
 
-      if (actionable) applyPenalty(poolState, lease.keyId, failure, classified)
+      if (actionable) await applyPenalty(poolState, lease.keyId, failure, classified)
 
       if (!actionable) {
         // Record it anyway. A structural failure is the one case where the panel
@@ -1478,43 +1544,52 @@ export function apply(ctx) {
         return
       }
 
-      if (!contentStarted) {
-        if (attempt >= attemptLimit) {
-          stats.poolExhausted += 1
-          yield failureFinish(
-            'MULTI_KEY_POOL_EXHAUSTED',
-            `Gave up after ${attempt} attempts on ${provider}/${model}: ${failure?.message ?? 'repeated rate limiting'}`,
-          )
-          return
-        }
-        await sleep(120 + Math.random() * 180)
-        continue
-      }
-
-      // Content already reached the consumer. The agent loop owns the retry so
-      // the partial attempt is recorded as an attempt and a fresh turn starts
-      // on a different key.
-      if (state.midStreamRetry) {
-        const pendingKey = options?.sessionId ?? sessionKey
-        const previous = pendingRetries.get(pendingKey)
+      // Retryable failure (nothing the consumer has seen yet, or a mid-stream
+      // cut). The step is closed here and reopened by the agent loop, so the
+      // plugin never calls `next` twice inside one dispatch.
+      const pendingKey = options?.sessionId ?? sessionKey
+      const rounds = (retryRounds.get(pendingKey) ?? 0) + 1
+      const budget = contentStarted ? Math.max(0, Number(state.midStreamMaxRetries ?? 2)) : retryBudget
+      if (rounds <= budget) {
+        retryRounds.set(pendingKey, rounds)
         pendingRetries.set(pendingKey, {
           provider,
           model,
           keyId: lease.keyId,
           lane,
+          stage: contentStarted ? 'mid' : 'pre',
           chars: emittedChars,
-          count: (previous?.count ?? 0) + 1,
+          count: rounds,
           at: Date.now(),
         })
+        record({
+          action: 'retry',
+          pool: `${provider}/${model}`,
+          key: lease.keyId,
+          lane,
+          detail: `round ${rounds}${contentStarted ? ' (mid-stream)' : ''}: ${String(failure?.message ?? '').slice(0, 80)}`,
+        })
+        yield failureFinish(
+          'MULTI_KEY_RETRY',
+          `Rotated away from ${lease.maskedLabel || lease.keyId} (${String(failure?.message ?? 'rate limited').slice(0, 120)})`,
+        )
+        return
       }
+      retryRounds.delete(pendingKey)
+      pendingRetries.delete(pendingKey)
+      stats.poolExhausted += 1
+      yield failureFinish(
+        'MULTI_KEY_POOL_EXHAUSTED',
+        `Gave up after ${rounds} attempts on ${provider}/${model}: ${failure?.message ?? 'repeated rate limiting'}`,
+      )
+      return
+
       // A thrown attempt yielded no `finish` chunk, so close it here: the agent
       // loop needs a termination reason before it can start the retry round.
       if (thrown !== undefined) yield failureFinish(failure.code, failure.message)
       return
     }
 
-    stats.poolExhausted += 1
-    yield failureFinish('MULTI_KEY_POOL_EXHAUSTED', `Attempt budget for ${provider}/${model} is spent.`)
   }
 
   // ------------------------------------------------------------- header seam
@@ -1584,17 +1659,16 @@ export function apply(ctx) {
    */
   const requestErrorListener = (payload, next) => {
     try {
-      if (!state.enabled || !state.midStreamRetry) return next()
+      if (!state.enabled) return next()
       const sessionId = payload?.agent?.id
       if (!sessionId) return next()
       const record_ = pendingRetries.get(sessionId)
       if (!record_) return next()
+      // Only a mid-stream cut is governed by the mid-stream switch; a request
+      // that failed before producing anything is not a partial answer.
+      if (record_.stage === 'mid' && !state.midStreamRetry) return next()
       if (record_.provider !== payload?.provider) return next()
       if (Date.now() - record_.at > PENDING_RETRY_TTL_MS) {
-        pendingRetries.delete(sessionId)
-        return next()
-      }
-      if (record_.count > Math.max(0, Number(state.midStreamMaxRetries ?? 2))) {
         pendingRetries.delete(sessionId)
         return next()
       }

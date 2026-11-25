@@ -266,3 +266,36 @@ test('off mode returns no decision at all', async () => {
   assert.equal(await harness.service.decide(KEY_A), undefined)
   assert.equal(fetchImpl.calls.length, 0)
 })
+
+test('a quota response with no quota structure is unknown, never exhausted', () => {
+  // The field failure: a maintenance page or an error object parses to "no
+  // windows", which used to sum to zero credits and park every key of the
+  // provider while all three accounts still had 23k credits each.
+  for (const body of [
+    { detail: 'service unavailable' },
+    { error: { message: 'rate limited' } },
+    { windows: [], resource_packs: [] },
+  ]) {
+    const normalized = normalizeEcnu(body)
+    assert.equal(normalized.state, 'unknown', JSON.stringify(body))
+    assert.equal(normalized.remaining, null, 'no number is invented')
+  }
+})
+
+test('a real zero balance is still recognised as exhausted', () => {
+  const normalized = normalizeEcnu({
+    windows: [{ type: 'fixed_168h', limit: 25000, used: 25000, remaining: 0 }],
+    resource_packs: [],
+  })
+  assert.equal(normalized.state, 'exhausted')
+  assert.equal(normalized.remaining, 0)
+})
+
+test('a healthy balance is ok and reports what is left', () => {
+  const normalized = normalizeEcnu({
+    windows: [{ type: 'fixed_168h', limit: 25000, used: 1864, remaining: 23136 }],
+    resource_packs: [],
+  })
+  assert.equal(normalized.state, 'ok')
+  assert.equal(normalized.remaining, 23136)
+})

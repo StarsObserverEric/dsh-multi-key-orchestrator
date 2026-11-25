@@ -108,6 +108,45 @@ export function normalizeEcnu(body, now = Date.now()) {
     ...packs.map((pack) => (pack.expiresAt ? Date.parse(pack.expiresAt) : 0)),
   ].filter((time) => time > 0)
 
+  // No quota structure at all is *not* a zero balance. A maintenance page, a
+  // gateway error object and a changed response shape all parse to "no
+  // windows", and treating that as "spent" parks every key of the provider on
+  // the strength of a response that said nothing about credits.
+  if (windows.length === 0 && packs.length === 0) {
+    const tolerant = tolerantExtract(body)
+    if (!tolerant) {
+      return {
+        state: QUOTA_STATE.unknown,
+        remaining: null,
+        total: null,
+        used: null,
+        unit: 'credits',
+        resetAt: null,
+        windows: [],
+        bonus: { remaining: 0, packs: [] },
+        account: {
+          providerId: typeof body?.provider_id === 'string' ? body.provider_id : null,
+          apiKeyId: safeAccountId(body?.api_key_id),
+        },
+        unrecognised: true,
+      }
+    }
+    return {
+      state: tolerant.total > 0 && tolerant.remaining >= tolerant.total ? QUOTA_STATE.ok : tolerant.remaining <= 0 ? QUOTA_STATE.exhausted : QUOTA_STATE.ok,
+      remaining: Number(tolerant.remaining.toFixed(4)),
+      total: Number(tolerant.total.toFixed(4)),
+      used: Number(Math.max(0, tolerant.total - tolerant.remaining).toFixed(4)),
+      unit: 'credits',
+      resetAt: null,
+      windows: [],
+      bonus: { remaining: 0, packs: [] },
+      account: {
+        providerId: typeof body?.provider_id === 'string' ? body.provider_id : null,
+        apiKeyId: safeAccountId(body?.api_key_id),
+      },
+    }
+  }
+
   let state = QUOTA_STATE.ok
   if (spendable <= 0) state = QUOTA_STATE.exhausted
   else if (total > 0 && spendable <= total * LOW_FRACTION) state = QUOTA_STATE.low
